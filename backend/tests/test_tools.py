@@ -47,6 +47,9 @@ class StubBroker:
     equity_orders: list[dict] = field(default_factory=list)
     option_orders: list[dict] = field(default_factory=list)
     fail_option_order: str | None = None
+    # Share-equivalent delta already resting at the broker, per symbol. Lets a
+    # test reproduce the condition that caused the live hedge runaway.
+    in_flight: dict[str, float] = field(default_factory=dict)
 
     async def get_account(self) -> AccountSnapshot:
         return AccountSnapshot(
@@ -78,8 +81,16 @@ class StubBroker:
     async def get_chain(self, underlying, **kwargs) -> list[ChainContract]:
         return [c for c in self.chain if c.underlying == underlying.upper()]
 
+    async def in_flight_equity_delta(self) -> dict[str, float]:
+        return dict(self.in_flight)
+
+    async def get_open_orders(self) -> list[dict]:
+        return []
+
     async def submit_equity_order(self, symbol, qty, side, client_order_id=None) -> dict:
-        order = {"id": f"eq-{len(self.equity_orders)}", "symbol": symbol, "qty": qty, "side": side}
+        order = {"id": f"eq-{len(self.equity_orders)}", "symbol": symbol, "qty": qty,
+                 "side": side, "status": "filled", "filled_qty": qty,
+                 "filled_avg_price": self.spots.get(symbol, SPOT)}
         self.equity_orders.append(order)
         return order
 
@@ -556,3 +567,68 @@ async def test_rejections_are_logged_with_the_full_gate_transcript():
     rejects = [e for e in state.audit.recent(50) if e["level"] == "reject"]
     assert rejects, "a vetoed order left no audit record"
     assert rejects[0]["data"]["gate"]["checks"], "gate transcript was not recorded"
+
+
+# --------------------------------------------------------------------------- #
+# In-flight suppression at the tool layer
+#
+# The pure function is tested in test_exits_and_spreads. This covers the path
+# that actually ran away in production: rebalance_portfolio must consult the
+# broker for resting orders before submitting, not just trust the position.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_rebalance_does_not_stack_orders_behind_a_resting_hedge():
+    contract = make_contract()
+    broker = StubBroker(positions=[option_position(contract, 1)])
+    tools = MagnoTools(make_session(broker))
+
+    first = await tools.rebalance_portfolio()
+    assert first["hedged"] is True
+    submitted = broker.equity_orders[0]["qty"]
+
+    # The fill has not settled: the position is unchanged, but the order rests.
+    broker.in_flight["SPY"] = -submitted
+
+    for _ in range(5):
+        result = await tools.rebalance_portfolio()
+        assert result["hedged"] is False
+    assert len(broker.equity_orders) == 1, "stacked duplicate hedges behind a resting order"
+
+
+@pytest.mark.asyncio
+async def test_rebalance_reports_why_it_stood_down():
+    contract = make_contract()
+    broker = StubBroker(positions=[option_position(contract, 1)], in_flight={"SPY": -53.0})
+    result = await MagnoTools(make_session(broker)).rebalance_portfolio()
+    assert result["hedged"] is False
+    assert "in flight" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_rebalance_tops_up_only_the_uncovered_remainder():
+    contract = make_contract()
+    broker = StubBroker(positions=[option_position(contract, 1)], in_flight={"SPY": -40.0})
+    tools = MagnoTools(make_session(broker))
+
+    result = await tools.rebalance_portfolio()
+    assert result["hedged"] is True
+    exact = contract.greeks.delta * 100 - 40.0
+    assert broker.equity_orders[0]["qty"] <= exact + 1e-9
+
+
+@pytest.mark.asyncio
+async def test_hedge_refuses_to_run_blind_when_open_orders_cannot_be_read():
+    """Fail closed. If we cannot tell what is already in flight, adding more is
+    exactly how the runaway happened."""
+    contract = make_contract()
+    broker = StubBroker(positions=[option_position(contract, 1)])
+
+    async def boom():
+        raise BrokerError("Alpaca unreachable")
+
+    broker.in_flight_equity_delta = lambda: boom()
+    result = await MagnoTools(make_session(broker)).rebalance_portfolio()
+
+    assert result["hedged"] is False
+    assert broker.equity_orders == []
+    assert "in-flight" in result["reason"]

@@ -689,6 +689,43 @@ class AlpacaBroker:
             raise BrokerError(_friendly_api_error(exc)) from exc
         return [_order_dict(o) for o in orders]
 
+    async def get_open_orders(self) -> list[dict]:
+        """Orders that are live at the broker but not yet resolved."""
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200, direction="desc")
+        try:
+            orders = await asyncio.to_thread(self.trading.get_orders, req)
+        except APIError as exc:
+            raise BrokerError(_friendly_api_error(exc)) from exc
+        return [_order_dict(o) for o in orders]
+
+    async def in_flight_equity_delta(self) -> dict[str, float]:
+        """Share-equivalent delta already committed but not yet filled, per symbol.
+
+        This closes a live runaway. The hedge engine derives net delta from
+        *positions*, and a position does not change until a fill settles. When
+        an order rests unfilled -- a name that has not crossed in the opening
+        auction, a limit the market moved away from -- the engine kept seeing
+        the same uncorrected exposure and fired another identical hedge every
+        cycle. Observed in production: nine stacked 56-share shorts against a
+        position that needed one, which would have left the account short
+        roughly 500 shares had they all filled at once.
+
+        A resting sell of 57 shares is -57 delta that is *already committed*.
+        Counting it prevents ordering it twice.
+        """
+        out: dict[str, float] = {}
+        for order in await self.get_open_orders():
+            if order.get("asset_class") != "us_equity":
+                continue
+            # Only the unfilled remainder is still in flight.
+            remaining = float(order.get("qty") or 0.0) - float(order.get("filled_qty") or 0.0)
+            if remaining <= 0:
+                continue
+            signed = remaining if str(order.get("side", "")).lower() == "buy" else -remaining
+            symbol = str(order.get("symbol", "")).upper()
+            out[symbol] = out.get(symbol, 0.0) + signed
+        return out
+
     async def cancel_order(self, order_id: str) -> None:
         """Cancel a resting order.
 

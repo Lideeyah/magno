@@ -721,6 +721,22 @@ class MagnoTools:
         market_open = await self.broker.is_market_open()
         view = await build_book(self.state)
 
+        # Delta already committed to the broker but not yet filled. Without
+        # this the engine re-hedges the same exposure every cycle while an
+        # order rests unfilled.
+        try:
+            in_flight = await self.broker.in_flight_equity_delta()
+        except BrokerError as exc:
+            # Fail closed: if we cannot tell what is already in flight, we
+            # cannot safely add more.
+            audit.warn(
+                EventCategory.HEDGE,
+                "Hedge skipped — in-flight state unknown",
+                f"Could not read open orders ({exc}). Refusing to hedge blind.",
+            )
+            return {"hedged": False, "reason": "in-flight order state unavailable",
+                    "net_delta": view.book.net_delta, "intents": []}
+
         effective = env
         if force:
             from dataclasses import replace
@@ -732,16 +748,25 @@ class MagnoTools:
             effective,
             buying_power=account.buying_power,
             market_open=market_open,
+            in_flight=in_flight,
         )
 
         if not intents:
+            committed = sum(abs(v) for v in in_flight.values())
+            reason = (
+                f"|Δ| {abs(view.book.net_delta):.3f} is inside the "
+                f"{env.delta_drift_threshold:.2f} drift cap"
+            )
+            if committed:
+                reason = (
+                    f"{committed:.3f}Δ already in flight covers the "
+                    f"{abs(view.book.net_delta):.3f}Δ exposure; nothing further to send"
+                )
             return {
                 "hedged": False,
-                "reason": (
-                    f"|Δ| {abs(view.book.net_delta):.3f} is inside the "
-                    f"{env.delta_drift_threshold:.2f} drift cap"
-                ),
+                "reason": reason,
                 "net_delta": view.book.net_delta,
+                "in_flight": in_flight,
                 "intents": [],
             }
 
@@ -799,14 +824,28 @@ class MagnoTools:
                 executed.append({"intent": intent.as_dict(), "submitted": False, "error": str(exc)})
                 continue
 
-            audit.success(
-                EventCategory.HEDGE,
-                f"Hedge filled — {intent.side.upper()} {intent.qty:.3f} {intent.underlying}",
-                f"δ {intent.net_delta_before:+.3f} → {intent.projected_delta_after:+.4f} "
-                f"(${intent.notional:,.2f} notional)",
-                intent=intent.as_dict(),
-                order=order,
-            )
+            # An accepted order is not a filled order. Reporting submission as
+            # a fill is what made the runaway invisible in the ledger: nine
+            # stacked shorts each logged "Hedge filled" while none had.
+            status = str(order.get("status", "")).lower()
+            filled_qty = float(order.get("filled_qty") or 0.0)
+            if status == "filled" and filled_qty > 0:
+                audit.success(
+                    EventCategory.HEDGE,
+                    f"Hedge FILLED — {intent.side.upper()} {filled_qty:.3f} {intent.underlying}",
+                    f"δ {intent.net_delta_before:+.3f} → {intent.projected_delta_after:+.4f} "
+                    f"at ${order.get('filled_avg_price') or intent.spot:,.2f}",
+                    intent=intent.as_dict(), order=order,
+                )
+            else:
+                audit.info(
+                    EventCategory.HEDGE,
+                    f"Hedge SUBMITTED — {intent.side.upper()} {intent.qty:.3f} {intent.underlying}",
+                    f"status {status or 'accepted'} · order {str(order.get('id'))[:8]} · "
+                    f"${intent.notional:,.2f} notional. Counted as in-flight until it fills; "
+                    f"no further hedge will be sent for this exposure.",
+                    intent=intent.as_dict(), order=order,
+                )
             executed.append({"intent": intent.as_dict(), "submitted": True, "order": order})
 
         return {

@@ -302,3 +302,93 @@ def test_net_delta_of_a_call_credit_spread_is_negative():
 def test_build_returns_none_when_no_wing_exists():
     short = make_contract(strike=450, dte=30, right="C")
     assert build_vertical(short, [short], contracts=1) is None
+
+
+# --------------------------------------------------------------------------- #
+# In-flight order tracking
+#
+# Found live, at the open. The engine derives delta from positions, and a
+# position does not move until a fill settles. With an order resting unfilled
+# in the opening auction it saw the same uncorrected exposure every five
+# seconds and fired an identical hedge each time — nine stacked 56-share shorts
+# against a position needing one. Had they all filled the account would have
+# been short ~500 shares on a book that wanted 57.
+# --------------------------------------------------------------------------- #
+from app.quant.hedge_engine import aggregate_portfolio, compute_hedge_intents  # noqa: E402
+from app.quant.risk_gate import RiskEnvelope  # noqa: E402
+
+from .test_quant import _equity, _option  # noqa: E402
+
+
+def long_call_book(delta=0.5741, spot=215.0):
+    """One long call, unhedged: the exact shape that ran away."""
+    return aggregate_portfolio(
+        [_option("NVDA260918C00215000", "NVDA", 1, delta)], {"NVDA": spot}
+    )
+
+
+def intents(book, in_flight=None):
+    return compute_hedge_intents(
+        book, RiskEnvelope(), buying_power=1e6, market_open=True, in_flight=in_flight
+    )
+
+
+def test_unhedged_book_still_produces_a_hedge():
+    assert len(intents(long_call_book())) == 1
+
+
+def test_a_resting_order_covering_the_exposure_suppresses_a_second_hedge():
+    """The regression. A pending sell of 57 shares is -57 delta already
+    committed; ordering it again is the runaway."""
+    assert intents(long_call_book(), {"NVDA": -57.0}) == []
+
+
+def test_repeated_cycles_do_not_stack_orders():
+    """Simulate the five-second loop: each pass sees the same position and the
+    same resting order, and must stay silent."""
+    book = long_call_book()
+    resting = {"NVDA": -57.0}
+    for _ in range(10):
+        assert intents(book, resting) == [], "engine re-hedged an exposure already in flight"
+
+
+def test_a_partially_covering_order_hedges_only_the_remainder():
+    book = long_call_book(delta=0.5741)          # +57.41 delta
+    result = intents(book, {"NVDA": -50.0})      # 50 already selling
+    assert len(result) == 1
+    assert result[0].side == "sell"
+    assert result[0].qty == pytest.approx(7.0)   # whole shares: still going short
+
+
+def test_an_oversized_resting_order_flips_the_correction():
+    """Over-sold in flight: the correction is now a buy, not another sell."""
+    result = intents(long_call_book(), {"NVDA": -80.0})
+    assert len(result) == 1 and result[0].side == "buy"
+
+
+def test_in_flight_is_recorded_on_the_intent_for_the_ledger():
+    result = intents(long_call_book(), {"NVDA": -50.0})
+    assert result[0].in_flight_delta == pytest.approx(-50.0)
+    assert "in flight" in result[0].reason
+
+
+def test_in_flight_on_another_underlying_does_not_suppress_this_one():
+    result = intents(long_call_book(), {"SPY": -57.0})
+    assert len(result) == 1 and result[0].underlying == "NVDA"
+
+
+def test_absent_in_flight_map_behaves_as_before():
+    assert len(compute_hedge_intents(
+        long_call_book(), RiskEnvelope(), buying_power=1e6, market_open=True
+    )) == 1
+
+
+def test_in_flight_is_included_in_the_fractional_short_decision():
+    """Effective equity holding includes resting sells, so the whole-share rule
+    still applies and cannot emit a fractional short."""
+    book = aggregate_portfolio(
+        [_option("NVDA260918C00215000", "NVDA", 1, 0.5741), _equity("NVDA", 10.0, 215.0)],
+        {"NVDA": 215.0},
+    )
+    result = intents(book, {"NVDA": -5.0})
+    assert result and result[0].qty % 1 == 0
