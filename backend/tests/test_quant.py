@@ -604,3 +604,67 @@ def test_residual_delta_after_whole_share_rounding_stays_inside_the_cap():
     for net in (1.2, 5.7, 48.372, 133.99):
         residual = net - hedge_quantity(net, 0.0)
         assert abs(residual) < 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Error reporting
+#
+# A live preflight showed Alpaca rejecting a fractional short sale with a 403,
+# which the handler reported as "rejected these credentials" — on keys that had
+# just succeeded twice in the same request. Misdiagnosing an operational refusal
+# as an auth failure sends an operator chasing a problem that does not exist.
+# --------------------------------------------------------------------------- #
+from app.broker import _friendly_api_error  # noqa: E402
+
+
+class _FakeAPIError(Exception):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
+def test_401_reports_a_credential_problem():
+    msg = _friendly_api_error(_FakeAPIError("unauthorized", 401))
+    assert "credentials" in msg.lower()
+
+
+def test_403_never_claims_the_credentials_are_bad():
+    """The keys are valid; the action is not permitted. Different problem."""
+    msg = _friendly_api_error(_FakeAPIError("fractional short selling is not supported", 403))
+    assert "credential" not in msg.lower()
+
+
+def test_403_carries_alpacas_own_words_through():
+    raw = "fractional short selling is not supported"
+    assert raw in _friendly_api_error(_FakeAPIError(raw, 403))
+
+
+def test_403_names_the_fractional_short_cause():
+    msg = _friendly_api_error(_FakeAPIError("fractional short selling is not supported", 403))
+    assert "whole number" in msg.lower()
+
+
+def test_403_names_the_options_level_cause():
+    msg = _friendly_api_error(_FakeAPIError("options level 3 required", 403))
+    assert "options level" in msg.lower()
+
+
+def test_unrecognised_403_still_surfaces_the_payload():
+    raw = "some brand new restriction nobody anticipated"
+    msg = _friendly_api_error(_FakeAPIError(raw, 403))
+    assert raw in msg and "403" in msg
+
+
+def test_options_wording_without_a_403_is_not_misreported_as_a_level_problem():
+    """Precedence bug: `"a" in t or "b" in t and code == 403` binds as
+    `"a" in t or ("b" in t and ...)`, so any text mentioning options trading
+    triggered the level hint regardless of status code."""
+    msg = _friendly_api_error(_FakeAPIError("options trading halted for this symbol", 503))
+    assert "not approved for the requested options level" not in msg
+
+
+def test_unknown_errors_pass_through_verbatim():
+    assert _friendly_api_error(_FakeAPIError("kaboom", 500)) == "kaboom"

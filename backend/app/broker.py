@@ -645,6 +645,27 @@ class AlpacaBroker:
             raise BrokerError(_friendly_api_error(exc)) from exc
         return [_order_dict(o) for o in orders]
 
+    async def cancel_order(self, order_id: str) -> None:
+        """Cancel a resting order.
+
+        Needed for any order that does not fill immediately — an options order
+        placed outside trading hours, or a limit that the market moves away
+        from. Without it the only way to clear a stuck order is the Alpaca
+        dashboard, which is not an acceptable answer for an autonomous agent.
+        """
+        try:
+            await asyncio.to_thread(self.trading.cancel_order_by_id, order_id)
+        except APIError as exc:
+            raise BrokerError(_friendly_api_error(exc)) from exc
+
+    async def cancel_all_orders(self) -> int:
+        """Cancel every open order. The panic button."""
+        try:
+            responses = await asyncio.to_thread(self.trading.cancel_orders)
+        except APIError as exc:
+            raise BrokerError(_friendly_api_error(exc)) from exc
+        return len(responses or [])
+
     async def close_position(self, symbol: str) -> dict:
         try:
             order = await asyncio.to_thread(self.trading.close_position, symbol.upper())
@@ -704,21 +725,57 @@ TERMINAL_STATUSES = {
 
 
 def _friendly_api_error(exc: APIError) -> str:
-    """Turn Alpaca's raw error bodies into something an operator can act on."""
+    """Turn Alpaca's raw error bodies into something an operator can act on.
+
+    The cardinal rule here is that context is *added* to Alpaca's own words, never
+    substituted for them. An earlier version collapsed 401 and 403 into a single
+    "bad credentials" message, which meant a perfectly valid rejection — Alpaca
+    refusing a fractional short sale — was reported as an authentication failure
+    on keys that were demonstrably working. That sends an operator hunting for a
+    problem that does not exist, during a live run, which is the worst possible
+    moment. The two codes mean different things:
+
+        401  the keys are wrong
+        403  the keys are fine; the *action* is not permitted
+
+    So 403 keeps Alpaca's payload verbatim and only prepends a hint.
+    """
     text = str(exc)
+    lowered = text.lower()
     code = getattr(exc, "status_code", None)
-    if code in (401, 403):
+
+    if code == 401:
         return (
-            "Alpaca rejected these credentials (401/403). Confirm you are using "
+            "Alpaca rejected these credentials (401). Confirm you are using "
             "**paper** keys from the Paper Trading dashboard, not live keys."
         )
+
+    if code == 403:
+        # Forbidden action, not a bad key. Lead with the specific cause when we
+        # recognise it, but always carry Alpaca's own text through.
+        if "fractional" in lowered and ("short" in lowered or "sell" in lowered):
+            hint = (
+                "Alpaca does not permit fractional short sales. A short hedge must "
+                "be a whole number of shares"
+            )
+        elif "options" in lowered and "level" in lowered:
+            hint = (
+                "This paper account is not approved for the requested options level. "
+                "Raise it in the Alpaca paper dashboard"
+            )
+        elif "buying power" in lowered or "insufficient" in lowered:
+            hint = "Insufficient buying power for this order"
+        else:
+            hint = "Alpaca refused this action (403); the credentials are valid"
+        return f"{hint} — Alpaca said: {text}"
+
     if code == 429:
-        return "Alpaca rate limit hit (429). Magno will retry on the next cycle."
-    if "subscription" in text.lower() or "not authorized" in text.lower():
+        return f"Alpaca rate limit hit (429). Magno will retry on the next cycle. ({text})"
+
+    if "subscription" in lowered or "not authorized" in lowered:
         return f"Alpaca data entitlement issue: {text}"
-    if "options trading" in text.lower() or "option" in text.lower() and code == 403:
-        return (
-            "This paper account is not approved for the requested options level. "
-            f"Raise it in the Alpaca paper dashboard. ({text})"
-        )
+
+    if code == 422:
+        return f"Alpaca rejected the order as malformed (422): {text}"
+
     return text

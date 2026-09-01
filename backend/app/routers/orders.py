@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
@@ -63,6 +65,152 @@ async def list_orders(limit: int = 50, state: SessionState = Depends(require_ses
         return {"orders": await state.broker.get_recent_orders(limit=min(max(limit, 1), 200))}
     except BrokerError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/diagnostics/preflight")
+async def preflight(state: SessionState = Depends(require_session)) -> dict:
+    """Probe the live order path with three tiny orders, then cancel them.
+
+    Every normal path is gated on market hours, so outside 09:30–16:00 ET an
+    order is stopped by Magno's own gate and never reaches Alpaca. That proves
+    the gate works and proves nothing about the broker. This deliberately
+    bypasses *only* the market-hours check so the submission path can be
+    verified before the open rather than discovered during it.
+
+    Three probes, each ~$8 of notional:
+
+    1. Fractional equity BUY  — expected to be accepted (fractional long).
+    2. Fractional equity SELL — expected to be REJECTED. Alpaca does not permit
+       fractional short sales, and this is the empirical confirmation of the
+       constraint the hedge engine is built around.
+    3. Options order — establishes what the broker actually does with an
+       options order outside trading hours.
+
+    Anything that rests is cancelled immediately. Nothing here can open a
+    meaningful position: sizes are the smallest that clear Alpaca's $1 notional
+    floor.
+    """
+    audit = state.audit
+    audit.warn(
+        EventCategory.SYSTEM,
+        "Preflight started",
+        "Probing the live Alpaca order path with cancellable test orders.",
+    )
+
+    probes: list[dict] = []
+    submitted_ids: list[str] = []
+
+    async def probe(name: str, expectation: str, coro) -> None:
+        try:
+            order = await coro
+            if order.get("id"):
+                submitted_ids.append(order["id"])
+            probes.append(
+                {
+                    "probe": name,
+                    "expectation": expectation,
+                    "accepted": True,
+                    "status": order.get("status"),
+                    "order_id": order.get("id"),
+                    "qty": order.get("qty"),
+                }
+            )
+        except BrokerError as exc:
+            probes.append(
+                {
+                    "probe": name,
+                    "expectation": expectation,
+                    "accepted": False,
+                    "error": str(exc),
+                }
+            )
+
+    spot = (await state.broker.get_spots(["SPY"])).get("SPY") or 0.0
+    # Smallest quantity that clears Alpaca's $1 minimum notional, with headroom.
+    qty = round(max(0.01, 2.0 / spot), 3) if spot else 0.01
+
+    await probe(
+        "fractional_equity_buy",
+        "accepted — fractional long is permitted",
+        state.broker.submit_equity_order("SPY", qty, "buy", client_order_id=f"magno-pre-b-{datetime.now(timezone.utc).timestamp():.0f}"),
+    )
+    await probe(
+        "fractional_equity_short_sell",
+        "rejected — Alpaca does not permit fractional short sales",
+        state.broker.submit_equity_order("SPY", qty, "sell", client_order_id=f"magno-pre-s-{datetime.now(timezone.utc).timestamp():.0f}"),
+    )
+
+    # A real, currently-quotable contract, priced the way the agent would.
+    option_symbol = None
+    try:
+        chain = await state.broker.get_chain("SPY", min_dte=5, max_dte=60, moneyness_band=0.05)
+        quotable = [c for c in chain if c.bid and c.ask and c.mid and c.mid < 8.0]
+        if quotable:
+            pick = min(quotable, key=lambda c: abs(c.moneyness))
+            option_symbol = pick.symbol
+            from ..broker import option_tick, round_to_tick
+
+            limit = round_to_tick(pick.ask + option_tick(pick.ask), up=True)
+            await probe(
+                "option_order_outside_hours",
+                "unknown — this is what we are here to find out",
+                state.broker.submit_option_order(
+                    pick.symbol, 1, "buy", limit_price=limit,
+                    client_order_id=f"magno-pre-o-{datetime.now(timezone.utc).timestamp():.0f}",
+                ),
+            )
+    except BrokerError as exc:
+        probes.append({"probe": "option_order_outside_hours", "accepted": False, "error": str(exc)})
+
+    # Clean up anything that rested.
+    cancelled = []
+    for order_id in submitted_ids:
+        try:
+            await state.broker.cancel_order(order_id)
+            cancelled.append(order_id)
+        except BrokerError as exc:
+            cancelled.append(f"{order_id}: FAILED — {exc}")
+
+    audit.warn(
+        EventCategory.SYSTEM,
+        "Preflight complete",
+        f"{sum(1 for p in probes if p['accepted'])}/{len(probes)} probes accepted; "
+        f"{len(cancelled)} order(s) cancelled.",
+        probes=probes,
+    )
+    return {
+        "spot": spot,
+        "probe_qty": qty,
+        "option_symbol": option_symbol,
+        "probes": probes,
+        "cancelled": cancelled,
+    }
+
+
+@router.delete("/orders/{order_id}")
+async def cancel_order(order_id: str, state: SessionState = Depends(require_session)) -> dict:
+    """Cancel one resting order."""
+    try:
+        await state.broker.cancel_order(order_id)
+    except BrokerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    state.audit.warn(
+        EventCategory.ORDER, "Order cancelled", f"Operator cancelled {order_id}.", order_id=order_id
+    )
+    return {"cancelled": True, "order_id": order_id}
+
+
+@router.delete("/orders")
+async def cancel_all_orders(state: SessionState = Depends(require_session)) -> dict:
+    """Cancel every open order. Leaves positions untouched."""
+    try:
+        count = await state.broker.cancel_all_orders()
+    except BrokerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    state.audit.warn(
+        EventCategory.ORDER, "All orders cancelled", f"{count} open order(s) cancelled.", count=count
+    )
+    return {"cancelled": count}
 
 
 @router.post("/positions/{symbol}/close")
