@@ -668,3 +668,39 @@ def test_options_wording_without_a_403_is_not_misreported_as_a_level_problem():
 
 def test_unknown_errors_pass_through_verbatim():
     assert _friendly_api_error(_FakeAPIError("kaboom", 500)) == "kaboom"
+
+
+def test_a_hedge_order_never_crosses_from_long_to_short():
+    """Alpaca refuses a single order that sells through zero into a short.
+
+    Reasoning about the resulting position being whole is not sufficient: the
+    order itself is a short sale in full, so a fractional quantity is rejected.
+    Observed live as 40310000 insufficient buying power while selling 48.295
+    against a 41.295 long.
+    """
+    qty = hedge_quantity(net_delta=48.966, equity_held=41.295)
+    assert qty == pytest.approx(41.295), "order crossed zero"
+    assert 41.295 - qty == pytest.approx(0.0), "should land exactly flat"
+
+
+def test_the_short_is_opened_on_the_following_cycle_from_flat():
+    """Having flattened, the remaining exposure becomes a clean whole-share short."""
+    remaining = 48.966 - 41.295
+    qty = hedge_quantity(net_delta=remaining, equity_held=0.0)
+    assert qty == pytest.approx(7.0)
+    assert qty % 1 == 0
+
+
+def test_buying_through_zero_is_also_capped():
+    """Symmetric: covering a short and going long stays one side of zero."""
+    qty = hedge_quantity(net_delta=-30.0, equity_held=-12.0)
+    assert qty <= 30.0
+
+
+@pytest.mark.parametrize("held,net", [(41.295, 48.966), (10.0, 25.5), (0.5, 3.2), (100.0, 100.7)])
+def test_no_hedge_order_ever_flips_the_sign_of_the_position(held, net):
+    qty = hedge_quantity(net, held)
+    resulting = held - qty
+    assert resulting >= -1e-9 or held <= 0, (
+        f"held={held} qty={qty} would cross zero to {resulting}"
+    )

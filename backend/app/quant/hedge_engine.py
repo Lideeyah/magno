@@ -257,11 +257,24 @@ def hedge_quantity(net_delta: float, equity_held: float) -> float:
         # Selling out of an existing long — fractional is accepted.
         return round_qty(qty)
 
-    # The fill would leave a short position. Whole shares only, rounded toward
-    # zero so we never overshoot into a larger short than intended.
+    # From here the fill would end short, and two separate Alpaca rules bite.
+    #
+    # A single order may not cross from long, through zero, into a short.
+    # Reasoning about the *resulting* position being whole is not enough:
+    # Alpaca evaluates the order, and a sell that ends short is a short sale in
+    # full, so a fractional quantity is refused outright --
+    #     40310000 insufficient buying power, available 41.295, existing 41.295
+    # observed live while trying to sell 48.295 against a 41.295 long.
+    #
+    # So an order never crosses zero. Sell the long down to flat and stop; the
+    # next cycle opens the short from a flat base, where the whole-share rule
+    # below applies cleanly. Costs one extra cycle, roughly five seconds, and
+    # removes a class of rejection entirely.
     if equity_held > 0:
-        # Sell the fractional long down to flat, then short a whole number.
-        return round_qty(equity_held + math.floor(qty - equity_held))
+        return round_qty(equity_held)
+
+    # Already flat or short: opening or extending a short must be whole shares,
+    # rounded toward zero so the hedge under-corrects rather than overshoots.
     return float(math.floor(qty))
 
 
