@@ -734,3 +734,23 @@ def test_no_hedge_order_ever_flips_the_sign_of_the_position(held, net):
     assert resulting >= -1e-9 or held <= 0, (
         f"held={held} qty={qty} would cross zero to {resulting}"
     )
+
+
+def test_quantity_available_is_not_reported_as_a_funding_problem():
+    """Alpaca reuses 40310000 for two unrelated causes.
+
+    "insufficient qty available" means the order asked for more than the
+    position can supply — an order crossing zero — not that the account is
+    short of capital. Reporting it as a buying-power problem sends an operator
+    to check funding, which was fine, while the real cause is the order size.
+    """
+    raw = '{"code":40310000,"message":"insufficient qty available for order (requested: 3, available: 2)"}'
+    msg = _friendly_api_error(_FakeAPIError(raw, 403))
+    assert "cross from long to short" in msg
+    assert "Insufficient buying power" not in msg
+    assert raw in msg, "Alpaca's payload must still carry through"
+
+
+def test_a_genuine_funding_shortfall_still_reports_buying_power():
+    msg = _friendly_api_error(_FakeAPIError("insufficient buying power", 403))
+    assert "buying power" in msg.lower()

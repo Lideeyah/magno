@@ -20,6 +20,11 @@ from ..state_store import SessionState
 router = APIRouter(prefix="/api", tags=["orders"])
 
 
+def _pid(tag: str) -> str:
+    """Collision-proof client order id for diagnostic probes."""
+    return f"magno-pre-{tag}-{datetime.now(timezone.utc):%H%M%S}-{secrets.token_hex(2)}"
+
+
 class OptionOrderRequest(BaseModel):
     symbol: str
     side: str = Field(pattern="^(buy|sell)$")
@@ -98,9 +103,6 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         "Preflight started",
         "Probing the live Alpaca order path with cancellable test orders.",
     )
-
-    def _pid(tag: str) -> str:
-        return f"magno-pre-{tag}-{datetime.now(timezone.utc):%H%M%S}-{secrets.token_hex(2)}"
 
     probes: list[dict] = []
     submitted_ids: list[str] = []
@@ -290,6 +292,100 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         "probes": probes,
         "cancelled": cancelled,
     }
+
+
+@router.post("/diagnostics/zero-cross")
+async def zero_cross_probe(state: SessionState = Depends(require_session)) -> dict:
+    """Prove the zero-crossing constraint and the fix, against the live broker.
+
+    A unit test cannot establish what Alpaca accepts, and the buy-side guard was
+    shipped on the strength of the sell-side evidence plus symmetry. This
+    reproduces the exact condition on SPY, at two shares, and records what the
+    broker actually does:
+
+      1. sell 2  from flat        -> opens a whole-share short (permitted)
+      2. buy  3  against -2       -> crosses zero; expected rejection
+      3. buy  2  against -2       -> the quantity the fixed engine produces
+      4. flat
+
+    Two shares of SPY is roughly $1,500 of notional held for a few seconds, and
+    the sequence nets to zero regardless of outcome.
+    """
+    from ..quant.hedge_engine import hedge_quantity
+
+    audit = state.audit
+    steps: list[dict] = []
+
+    async def spy_qty() -> float:
+        for pos in await state.broker.get_positions():
+            if pos.symbol.upper() == "SPY" and not pos.is_option:
+                return pos.qty
+        return 0.0
+
+    async def step(name: str, expectation: str, coro) -> dict:
+        try:
+            order = await coro
+            entry = {"step": name, "expectation": expectation, "accepted": True,
+                     "status": order.get("status"), "order_id": order.get("id")}
+        except BrokerError as exc:
+            entry = {"step": name, "expectation": expectation, "accepted": False,
+                     "error": str(exc)}
+        steps.append(entry)
+        return entry
+
+    start = await spy_qty()
+    if abs(start) > 1e-6:
+        return {"ran": False, "error": f"SPY equity position is {start}; probe needs a flat leg."}
+
+    audit.warn(EventCategory.SYSTEM, "Zero-cross probe started",
+               "Proving the long/short crossing constraint on SPY at 2 shares.")
+
+    # 1. Open a whole-share short.
+    await step("open_short_2", "accepted — whole-share short is permitted",
+               state.broker.submit_equity_order("SPY", 2, "sell", client_order_id=_pid("z1")))
+    for _ in range(10):
+        await asyncio.sleep(1.0)
+        if await spy_qty() <= -1.999:
+            break
+    steps[-1]["position_after"] = await spy_qty()
+
+    if steps[-1]["position_after"] > -1.999:
+        await state.broker.cancel_all_orders()
+        return {"ran": False, "error": "Short leg did not fill; cannot run the crossing test.",
+                "steps": steps}
+
+    # 2. The order the OLD code would have produced: buy more than the short.
+    await step("crossing_buy_3", "REJECTED — buying 3 against a 2-share short crosses zero",
+               state.broker.submit_equity_order("SPY", 3, "buy", client_order_id=_pid("z2")))
+    await asyncio.sleep(2.0)
+    steps[-1]["position_after"] = await spy_qty()
+
+    # 3. The order the FIXED code produces for the same exposure.
+    capped = hedge_quantity(net_delta=-3.0, equity_held=-2.0)
+    steps.append({"step": "engine_output", "note":
+                  f"hedge_quantity(net=-3.0, held=-2.0) = {capped}"})
+    await step("capped_buy", f"accepted — capped at the short size ({capped})",
+               state.broker.submit_equity_order("SPY", capped, "buy", client_order_id=_pid("z3")))
+    for _ in range(10):
+        await asyncio.sleep(1.0)
+        if abs(await spy_qty()) < 1e-6:
+            break
+    steps[-1]["position_after"] = await spy_qty()
+
+    # 4. Leave nothing behind.
+    await state.broker.cancel_all_orders()
+    residual = await spy_qty()
+    if abs(residual) > 1e-6:
+        try:
+            await state.broker.close_position("SPY")
+        except BrokerError:
+            pass
+        await asyncio.sleep(2.0)
+        residual = await spy_qty()
+
+    audit.warn(EventCategory.SYSTEM, "Zero-cross probe complete",
+               f"{sum(1 for s in steps if s.get('accepted'))} accepted; residual {residual}")
+    return {"ran": True, "steps": steps, "residual_spy": residual, "clean": abs(residual) < 1e-6}
 
 
 @router.delete("/orders/{order_id}")

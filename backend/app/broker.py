@@ -845,6 +845,19 @@ def _friendly_api_error(exc: APIError) -> str:
                 "This paper account is not approved for the requested options level. "
                 "Raise it in the Alpaca paper dashboard"
             )
+        elif "insufficient qty available" in lowered or "available" in lowered and "qty" in lowered:
+            # 40310000 is reused for two different problems. This one is not
+            # about capital at all: it means the order asked for more quantity
+            # than the position can supply — buying back more than you are
+            # short, or selling more than you hold. An order may not cross
+            # through zero. Reading it as a funding problem sends an operator
+            # to check buying power, which is fine, while the real cause is the
+            # order size relative to the position.
+            hint = (
+                "Order quantity exceeds the position available. An order cannot "
+                "cross from long to short (or short to long) in one fill — close "
+                "to flat first, then open the other side"
+            )
         elif "buying power" in lowered or "insufficient" in lowered:
             hint = "Insufficient buying power for this order"
         else:
