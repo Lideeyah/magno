@@ -1,0 +1,15 @@
+{
+  "_comment": "Drop this into your MCP client config (e.g. Claude Desktop's claude_desktop_config.json). Replace the absolute paths and paper credentials. Magno's four tools run the identical risk gates the autonomous loop uses.",
+  "mcpServers": {
+    "magno-alpaca": {
+      "command": "/absolute/path/to/Magno/backend/.venv/bin/python",
+      "args": ["-m", "app.agents.alpaca_mcp"],
+      "cwd": "/absolute/path/to/Magno/backend",
+      "env": {
+        "ALPACA_API_KEY": "PK_your_paper_key_id",
+        "ALPACA_SECRET_KEY": "your_paper_secret",
+        "MAGNO_UNIVERSE": "SPY,QQQ,NVDA,AAPL"
+      }
+    }
+  }
+}
