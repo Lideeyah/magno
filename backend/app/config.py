@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # --- Universe ---
     universe: list[str] = ["SPY", "QQQ", "NVDA", "AAPL"]
 
+    # --- Dedicated auto-demo sandbox ---
+    # Read by app.demo_main only. The production app never touches these.
+    demo_alpaca_api_key: str | None = None
+    demo_alpaca_secret_key: str | None = None
+    demo_alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    demo_featherless_api_key: str | None = None
+    demo_port: int = 3001
+    demo_backend_port: int = 8001
+
     # --- Server ---
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     risk_free_rate: float = 0.0425

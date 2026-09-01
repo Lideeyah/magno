@@ -15,7 +15,7 @@ import { ExecutionAuditStream } from "@/components/ExecutionAuditStream";
 import { GreeksTelemetry } from "@/components/GreeksTelemetry";
 import { PositionsPanel } from "@/components/PositionsPanel";
 import { Badge, Button, Panel } from "@/components/ui";
-import { getSessionId, setSessionId } from "@/lib/api";
+import { API_BASE, getSessionId, setSessionId } from "@/lib/api";
 import { cn, greek, num, usd, usdSigned } from "@/lib/format";
 import type { AuditEvent, GateResult } from "@/lib/types";
 import { useTelemetry } from "@/lib/useTelemetry";
@@ -38,16 +38,41 @@ export default function DemoPage() {
   const [sessionReady, setSessionReady] = React.useState(false);
   const [manualId, setManualId] = React.useState("");
 
-  // localStorage is per-origin, so :3001 cannot see the session :3000 stored.
-  // Accept a handoff via ?session=, then remember it on this origin.
+  // The demo backend mints its own session from DEMO_ALPACA_* credentials at
+  // startup, so the page connects with no manual step. A ?session= override is
+  // still honoured for attaching to a specific existing session.
+  const [bootError, setBootError] = React.useState<string | null>(null);
+
   React.useEffect(() => {
     const fromUrl = new URLSearchParams(window.location.search).get("session");
     if (fromUrl) {
       setSessionId(fromUrl);
       window.history.replaceState({}, "", window.location.pathname);
+      setSessionReady(true);
+      setMounted(true);
+      return;
     }
-    setSessionReady(Boolean(fromUrl || getSessionId()));
-    setMounted(true);
+
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/demo/session`);
+        const body = await res.json();
+        if (body.ready && body.session_id) {
+          setSessionId(body.session_id);
+          setSessionReady(true);
+        } else {
+          setBootError(body.error ?? "Demo backend has no session.");
+          setSessionReady(Boolean(getSessionId()));
+        }
+      } catch {
+        setBootError(
+          `Cannot reach the demo backend at ${API_BASE}. Start it with: uvicorn app.demo_main:app --port 8001`,
+        );
+        setSessionReady(Boolean(getSessionId()));
+      } finally {
+        setMounted(true);
+      }
+    })();
   }, []);
 
   // --- the sequencer -------------------------------------------------------
@@ -130,14 +155,18 @@ export default function DemoPage() {
         <div className="panel w-full max-w-lg p-6">
           <h1 className="text-lg font-semibold text-foreground">Demo sandbox</h1>
           <p className="mt-2 text-xs leading-relaxed text-muted">
-            This instance is isolated from the primary terminal — separate port,
-            separate build directory, read-only. It needs the session id of a
-            connected account to render live telemetry.
+            The demo backend mints its own Alpaca session from{" "}
+            <code className="num text-foreground">DEMO_ALPACA_*</code> credentials,
+            so this page normally connects on its own.
           </p>
+          {bootError && (
+            <p className="mt-3 rounded-card border border-negative/30 bg-negative/5 px-3 py-2 text-2xs leading-relaxed text-negative">
+              {bootError}
+            </p>
+          )}
           <p className="mt-3 text-2xs leading-relaxed text-subtle">
-            Browser storage is per-origin, so this port cannot see the session the
-            terminal saved on :3000. Paste the id once, or open{" "}
-            <code className="num text-foreground">/demo?session=&lt;id&gt;</code>.
+            Set the keys in <code className="num text-foreground">backend/.env.demo</code>{" "}
+            and start the demo backend, or attach to an existing session id below.
           </p>
           <div className="mt-4 flex gap-2">
             <input

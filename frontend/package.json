@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "demo": "NEXT_DIST_DIR=.next-demo next dev -p ${DEMO_PORT:-3001}",
+    "demo": "NEXT_PUBLIC_MAGNO_API=${DEMO_BACKEND:-http://127.0.0.1:8001} NEXT_DIST_DIR=.next-demo next dev -p ${DEMO_PORT:-3001}",
     "demo:build": "NEXT_DIST_DIR=.next-demo next build"
   },
   "dependencies": {
