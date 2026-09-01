@@ -18,6 +18,7 @@ from typing import Any
 from .broker import AccountSnapshot, AlpacaBroker
 from .config import settings
 from .events import AuditLog
+from .quant.exit_rules import ExitPolicy
 from .quant.risk_gate import RiskEnvelope
 
 
@@ -112,6 +113,9 @@ class SessionState:
     account: AccountSnapshot
     created_at: datetime
 
+    # Exit envelope: profit target, stop and time stop.
+    exit_policy: ExitPolicy = field(default_factory=ExitPolicy)
+
     # Baseline for the daily-loss circuit breaker, captured at onboarding.
     equity_at_open: float = 0.0
     contract_qty: int = 1
@@ -144,6 +148,7 @@ class SessionState:
             "strategy": self.strategy.value,
             "strategy_label": self.strategy.label,
             "envelope": self.envelope.as_dict(),
+            "exit_policy": self.exit_policy.as_dict(),
             "contract_qty": self.contract_qty,
             "autopilot": self.autopilot,
             "equity_at_open": self.equity_at_open,
