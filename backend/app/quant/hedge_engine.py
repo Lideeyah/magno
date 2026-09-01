@@ -166,6 +166,8 @@ class HedgeIntent:
     projected_delta_after: float
     reason: str
     gate: GateResult | None = None
+    # Share-equivalent delta already ordered but unfilled at decision time.
+    in_flight_delta: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -181,6 +183,7 @@ class HedgeIntent:
             "net_delta_before": self.net_delta_before,
             "projected_delta_after": self.projected_delta_after,
             "reason": self.reason,
+            "in_flight_delta": self.in_flight_delta,
             "gate": self.gate.as_dict() if self.gate else None,
         }
 
@@ -271,24 +274,39 @@ def compute_hedge_intents(
     *,
     buying_power: float,
     market_open: bool,
+    in_flight: dict[str, float] | None = None,
 ) -> list[HedgeIntent]:
     """Produce one hedge intent per underlying whose |Δ| breached the threshold.
 
     The correction is exact: to neutralise +Δ we *sell* Δ shares, and to
     neutralise −Δ we *buy* |Δ| shares, leaving projected delta at zero modulo
     the 3dp quantity rounding.
+
+    ``in_flight`` carries share-equivalent delta that has already been ordered
+    but has not yet filled. Ignoring it caused a live runaway: positions do not
+    move until a fill settles, so an order resting in an opening auction left
+    the engine seeing the same uncorrected exposure every five seconds and
+    firing an identical hedge each time. The exposure to correct is therefore
+
+        Δ_effective = Δ_positions + Δ_in_flight
+
+    and an underlying with enough already in flight produces no intent at all.
     """
     intents: list[HedgeIntent] = []
     threshold = envelope.delta_drift_threshold
+    in_flight = in_flight or {}
 
     for exp in book.by_underlying.values():
-        net = exp.net_delta
+        committed = in_flight.get(exp.underlying, 0.0)
+        net = exp.net_delta + committed
         if math.isnan(net) or abs(net) < threshold:
             continue
         if exp.spot <= 0:
             continue
 
-        qty = hedge_quantity(net, exp.equity_delta)
+        # Effective equity holding includes resting orders, so the
+        # fractional-short rule accounts for shares already being sold.
+        qty = hedge_quantity(net, exp.equity_delta + committed)
         if qty <= 0:
             # Whole-share rounding can zero out a sub-share short hedge. The
             # residual is under one delta, so the book is neutral enough.
@@ -303,9 +321,12 @@ def compute_hedge_intents(
             spot=exp.spot,
             net_delta_before=net,
             projected_delta_after=net + signed_fill,
+            in_flight_delta=committed,
             reason=(
                 f"|Δ| {abs(net):.3f} ≥ {threshold:.2f} drift cap → "
                 f"{side} {qty:.3f} {exp.underlying} to neutralise"
+                + (f" (position {exp.net_delta:+.3f}, {committed:+.3f} already in flight)"
+                   if committed else "")
             ),
         )
         intent.gate = evaluate_hedge_order(

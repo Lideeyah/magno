@@ -38,8 +38,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     AssetStatus,
     ContractType,
+    OrderClass,
     OrderSide,
     OrderStatus,
+    PositionIntent,
     QueryOrderStatus,
     TimeInForce,
 )
@@ -48,6 +50,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    OptionLegRequest,
 )
 
 from .config import settings
@@ -630,6 +633,47 @@ class AlpacaBroker:
             )
         return await self._submit(request)
 
+    async def submit_vertical_spread(
+        self,
+        short_symbol: str,
+        long_symbol: str,
+        qty: int,
+        limit_credit: float,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """Submit both legs of a credit vertical as one atomic package.
+
+        Legging in separately is the failure mode this exists to avoid: if the
+        short fills and the long does not, the account is holding naked risk —
+        precisely the thing the spread was built to prevent. Alpaca's MLEG order
+        class fills both legs or neither.
+
+        ``limit_credit`` is the net credit per share. Alpaca expresses a
+        multi-leg credit as a negative limit price.
+        """
+        request = LimitOrderRequest(
+            qty=int(abs(qty)),
+            order_class=OrderClass.MLEG,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(abs(limit_credit), 2) * -1,
+            client_order_id=client_order_id,
+            legs=[
+                OptionLegRequest(
+                    symbol=short_symbol.upper(),
+                    ratio_qty=1,
+                    side=OrderSide.SELL,
+                    position_intent=PositionIntent.SELL_TO_OPEN,
+                ),
+                OptionLegRequest(
+                    symbol=long_symbol.upper(),
+                    ratio_qty=1,
+                    side=OrderSide.BUY,
+                    position_intent=PositionIntent.BUY_TO_OPEN,
+                ),
+            ],
+        )
+        return await self._submit(request)
+
     async def _submit(self, request) -> dict:
         try:
             order = await asyncio.to_thread(self.trading.submit_order, request)
@@ -644,6 +688,43 @@ class AlpacaBroker:
         except APIError as exc:
             raise BrokerError(_friendly_api_error(exc)) from exc
         return [_order_dict(o) for o in orders]
+
+    async def get_open_orders(self) -> list[dict]:
+        """Orders that are live at the broker but not yet resolved."""
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200, direction="desc")
+        try:
+            orders = await asyncio.to_thread(self.trading.get_orders, req)
+        except APIError as exc:
+            raise BrokerError(_friendly_api_error(exc)) from exc
+        return [_order_dict(o) for o in orders]
+
+    async def in_flight_equity_delta(self) -> dict[str, float]:
+        """Share-equivalent delta already committed but not yet filled, per symbol.
+
+        This closes a live runaway. The hedge engine derives net delta from
+        *positions*, and a position does not change until a fill settles. When
+        an order rests unfilled -- a name that has not crossed in the opening
+        auction, a limit the market moved away from -- the engine kept seeing
+        the same uncorrected exposure and fired another identical hedge every
+        cycle. Observed in production: nine stacked 56-share shorts against a
+        position that needed one, which would have left the account short
+        roughly 500 shares had they all filled at once.
+
+        A resting sell of 57 shares is -57 delta that is *already committed*.
+        Counting it prevents ordering it twice.
+        """
+        out: dict[str, float] = {}
+        for order in await self.get_open_orders():
+            if order.get("asset_class") != "us_equity":
+                continue
+            # Only the unfilled remainder is still in flight.
+            remaining = float(order.get("qty") or 0.0) - float(order.get("filled_qty") or 0.0)
+            if remaining <= 0:
+                continue
+            signed = remaining if str(order.get("side", "")).lower() == "buy" else -remaining
+            symbol = str(order.get("symbol", "")).upper()
+            out[symbol] = out.get(symbol, 0.0) + signed
+        return out
 
     async def cancel_order(self, order_id: str) -> None:
         """Cancel a resting order.

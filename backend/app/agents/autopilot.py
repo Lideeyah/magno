@@ -55,6 +55,7 @@ async def run_autopilot(state: SessionState) -> None:
         while True:
             loop_started = asyncio.get_event_loop().time()
             try:
+                await _exit_tick(state, tools)
                 await _hedge_tick(state, tools)
 
                 if loop_started - last_reason >= settings.reasoning_interval_s:
@@ -82,6 +83,23 @@ async def run_autopilot(state: SessionState) -> None:
     except asyncio.CancelledError:
         audit.warn(EventCategory.SYSTEM, "Autopilot disengaged", "Operator stopped the agent.")
         raise
+
+
+async def _exit_tick(state: SessionState, tools: MagnoTools) -> None:
+    """Take profits, cut losses, and stand down before expiry.
+
+    Runs ahead of the hedge on every cycle and is exempt from the daily-loss
+    breaker. A breaker that stops an agent closing a losing position during a
+    drawdown makes the drawdown worse — it must only stop *new* risk.
+    """
+    async with state.trade_lock:
+        result = await tools.close_expiring_and_triggered()
+    if result.get("closed"):
+        state.audit.info(
+            EventCategory.ORDER,
+            "Exit cycle complete",
+            f"{result['closed']} position(s) closed on profit, stop or time.",
+        )
 
 
 async def _hedge_tick(state: SessionState, tools: MagnoTools) -> None:
@@ -206,13 +224,24 @@ async def _reasoning_tick(state: SessionState, tools: MagnoTools) -> None:
 
         chosen = next((c for c in candidates if c.symbol == decision.symbol), None)
         async with state.trade_lock:
-            await tools.execute_options_strategy(
-                symbol=decision.symbol or "",
-                side=decision.side,
-                contracts=decision.contracts,
-                thesis=decision.thesis,
-                contract=chosen,
-            )
+            if decision.side == "sell":
+                # A naked short has unbounded loss, which contradicts the
+                # defined-risk mandate. Sell signals are expressed as credit
+                # verticals; if no wing is quotable the agent stands down rather
+                # than selling naked.
+                await tools.execute_vertical_spread(
+                    short_symbol=decision.symbol or "",
+                    contracts=decision.contracts,
+                    thesis=decision.thesis,
+                )
+            else:
+                await tools.execute_options_strategy(
+                    symbol=decision.symbol or "",
+                    side=decision.side,
+                    contracts=decision.contracts,
+                    thesis=decision.thesis,
+                    contract=chosen,
+                )
             # Opening a position moves delta immediately; correct it now rather
             # than carrying naked exposure until the next hedge tick.
             await tools.rebalance_portfolio()

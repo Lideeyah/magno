@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,6 +41,17 @@ from ..quant.risk_gate import GateResult, evaluate_option_order
 from ..state_store import SessionState
 
 log = logging.getLogger("magno.tools")
+
+
+def _order_id(prefix: str) -> str:
+    """Collision-proof client order id.
+
+    Second-resolution timestamps are not unique: an entry and the hedge it
+    triggers are submitted within the same second, and Alpaca rejects a
+    duplicate client_order_id. A short random suffix removes the class of bug
+    entirely.
+    """
+    return f"magno-{prefix}-{datetime.now(timezone.utc):%H%M%S}-{secrets.token_hex(3)}"
 
 
 class BookView:
@@ -316,7 +328,7 @@ class MagnoTools:
                 qty=contracts,
                 side=side,
                 limit_price=limit,
-                client_order_id=f"magno-opt-{datetime.now(timezone.utc).timestamp():.0f}",
+                client_order_id=_order_id("opt"),
             )
         except BrokerError as exc:
             audit.error(EventCategory.ORDER, f"Broker rejected {symbol}", str(exc), symbol=symbol)
@@ -338,6 +350,195 @@ class MagnoTools:
             forced=force,
         )
         return {"submitted": True, "order": order, "gate": gate.as_dict(), "limit_price": limit}
+
+    # ------------------------------------------------------------------ #
+    # Exits
+    # ------------------------------------------------------------------ #
+    async def close_expiring_and_triggered(self) -> dict[str, Any]:
+        """Close option positions that hit a profit target, stop or time stop.
+
+        Deliberately exempt from the daily-loss breaker, for the same reason
+        hedging is: the breaker exists to stop *new* risk, and a rule that
+        prevents an agent from closing a losing position during a drawdown makes
+        the drawdown worse. Exits always run.
+        """
+        from ..quant.exit_rules import ExitPolicy, evaluate_exits, realised_pnl_estimate
+
+        audit = self.state.audit
+        market_open = await self.broker.is_market_open()
+        view = await build_book(self.state)
+
+        policy = self.state.exit_policy or ExitPolicy()
+        decisions = evaluate_exits(view.positions, policy)
+
+        if not decisions:
+            return {"closed": 0, "decisions": [], "reason": "no exit condition met"}
+
+        if not market_open:
+            audit.info(
+                EventCategory.RISK,
+                f"{len(decisions)} exit condition(s) pending",
+                "Market is closed; positions will be closed at the open.",
+                decisions=[d.as_dict() for d in decisions],
+            )
+            return {"closed": 0, "decisions": [d.as_dict() for d in decisions],
+                    "reason": "market closed"}
+
+        if self.state.shocks:
+            # A shocked book is hypothetical; closing against simulated marks
+            # would realise a P&L that never happened.
+            return {"closed": 0, "decisions": [d.as_dict() for d in decisions],
+                    "reason": "shock simulation active"}
+
+        by_symbol = {p.symbol: p for p in view.positions}
+        results: list[dict] = []
+        closed = 0
+
+        for decision in decisions:
+            position = by_symbol.get(decision.symbol)
+            pnl = realised_pnl_estimate(position) if position else 0.0
+            try:
+                order = await self.broker.close_position(decision.symbol)
+            except BrokerError as exc:
+                audit.error(
+                    EventCategory.ORDER,
+                    f"Exit failed — {decision.symbol}",
+                    str(exc),
+                    decision=decision.as_dict(),
+                )
+                results.append({"decision": decision.as_dict(), "closed": False, "error": str(exc)})
+                continue
+
+            closed += 1
+            level = EventLevel.SUCCESS if pnl >= 0 else EventLevel.WARN
+            audit.emit(
+                EventCategory.ORDER,
+                level,
+                f"Exit — {decision.symbol} ({decision.triggers[0].code})",
+                f"{decision.summary}. Realised approximately ${pnl:,.2f}.",
+                decision=decision.as_dict(),
+                order=order,
+                pnl=pnl,
+            )
+            results.append({"decision": decision.as_dict(), "closed": True, "order": order, "pnl": pnl})
+
+        return {"closed": closed, "decisions": [d.as_dict() for d in decisions], "results": results}
+
+    # ------------------------------------------------------------------ #
+    # Defined-risk spread execution
+    # ------------------------------------------------------------------ #
+    async def execute_vertical_spread(
+        self,
+        short_symbol: str,
+        contracts: int = 1,
+        thesis: str = "",
+    ) -> dict[str, Any]:
+        """Open a credit vertical around a chosen short strike.
+
+        Replaces the naked single-leg short that the sell signal used to
+        produce. Both legs are submitted as one atomic package: legging in
+        separately risks the short filling while the wing does not, which leaves
+        exactly the naked exposure this is meant to eliminate.
+        """
+        from ..quant.greeks import parse_occ
+        from ..quant.spreads import build_vertical, validate_vertical
+
+        audit = self.state.audit
+        env = self.state.envelope
+        short_symbol = short_symbol.upper()
+
+        occ = parse_occ(short_symbol)
+        if occ is None:
+            return {"submitted": False, "error": f"{short_symbol} is not a valid OCC symbol."}
+
+        try:
+            chain = await self.broker.get_chain(
+                occ.underlying,
+                min_dte=max(0.0, env.min_dte - 2),
+                max_dte=env.max_dte + 2,
+                moneyness_band=0.30,
+                use_cache=False,
+            )
+        except BrokerError as exc:
+            return {"submitted": False, "error": str(exc)}
+
+        short_contract = next((c for c in chain if c.symbol == short_symbol), None)
+        if short_contract is None:
+            return {"submitted": False, "error": f"No live quote for {short_symbol}."}
+
+        spread = build_vertical(short_contract, chain, contracts)
+        if spread is None:
+            audit.reject(
+                EventCategory.GATE,
+                f"No wing available — {short_symbol}",
+                "Could not find a quotable further-OTM strike in the same expiry, so a "
+                "defined-risk structure cannot be built. Standing down rather than "
+                "selling naked.",
+                symbol=short_symbol,
+            )
+            return {"submitted": False, "error": "No suitable wing; refusing to sell naked."}
+
+        ok, reason = validate_vertical(spread)
+        if not ok:
+            audit.reject(
+                EventCategory.GATE, f"Spread rejected — {short_symbol}", reason,
+                spread=spread.as_dict(),
+            )
+            return {"submitted": False, "error": reason, "spread": spread.as_dict()}
+
+        account = await self.broker.get_account()
+        market_open = await self.broker.is_market_open()
+
+        # Allocation is measured against max loss, not premium. For a credit
+        # spread the premium received is not the risk — the width is.
+        risk = spread.capital_at_risk or 0.0
+        gate = evaluate_option_order(
+            bid=short_contract.bid,
+            ask=short_contract.ask,
+            iv=short_contract.iv,
+            dte=short_contract.dte,
+            open_interest=short_contract.open_interest,
+            contracts=contracts,
+            buying_power=account.options_buying_power or account.buying_power,
+            open_positions=(await build_book(self.state)).book.gross_option_positions,
+            day_pnl=account.day_pnl,
+            equity_at_open=self.state.equity_at_open,
+            market_open=market_open,
+            envelope=env,
+        )
+        from ..quant.risk_gate import validate_allocation
+
+        gate.add(validate_allocation(risk, account.buying_power, env.max_allocation_pct))
+
+        if not gate.approved:
+            audit.reject(
+                EventCategory.GATE, f"Spread vetoed — {short_symbol}", gate.summary,
+                spread=spread.as_dict(), gate=gate.as_dict(),
+            )
+            return {"submitted": False, "gate": gate.as_dict(), "error": gate.summary}
+
+        # Give up a tick of credit to get filled.
+        credit = max(0.01, (spread.net_credit or 0.0) - 0.05)
+        try:
+            order = await self.broker.submit_vertical_spread(
+                short_symbol=spread.short_leg.symbol,
+                long_symbol=spread.long_leg.symbol,
+                qty=contracts,
+                limit_credit=credit,
+                client_order_id=_order_id("spr"),
+            )
+        except BrokerError as exc:
+            audit.error(EventCategory.ORDER, f"Broker rejected spread {short_symbol}", str(exc))
+            return {"submitted": False, "error": str(exc), "spread": spread.as_dict()}
+
+        audit.success(
+            EventCategory.ORDER,
+            f"SELL {contracts}x {spread.underlying} {spread.short_leg.strike:g}/"
+            f"{spread.long_leg.strike:g} {spread.right} vertical",
+            f"{thesis} · {reason} · max loss ${risk:,.0f}",
+            spread=spread.as_dict(), order=order, gate=gate.as_dict(),
+        )
+        return {"submitted": True, "order": order, "spread": spread.as_dict(), "gate": gate.as_dict()}
 
     # ------------------------------------------------------------------ #
     # Dry-run reasoning (demonstration harness)
@@ -520,6 +721,22 @@ class MagnoTools:
         market_open = await self.broker.is_market_open()
         view = await build_book(self.state)
 
+        # Delta already committed to the broker but not yet filled. Without
+        # this the engine re-hedges the same exposure every cycle while an
+        # order rests unfilled.
+        try:
+            in_flight = await self.broker.in_flight_equity_delta()
+        except BrokerError as exc:
+            # Fail closed: if we cannot tell what is already in flight, we
+            # cannot safely add more.
+            audit.warn(
+                EventCategory.HEDGE,
+                "Hedge skipped — in-flight state unknown",
+                f"Could not read open orders ({exc}). Refusing to hedge blind.",
+            )
+            return {"hedged": False, "reason": "in-flight order state unavailable",
+                    "net_delta": view.book.net_delta, "intents": []}
+
         effective = env
         if force:
             from dataclasses import replace
@@ -531,16 +748,25 @@ class MagnoTools:
             effective,
             buying_power=account.buying_power,
             market_open=market_open,
+            in_flight=in_flight,
         )
 
         if not intents:
+            committed = sum(abs(v) for v in in_flight.values())
+            reason = (
+                f"|Δ| {abs(view.book.net_delta):.3f} is inside the "
+                f"{env.delta_drift_threshold:.2f} drift cap"
+            )
+            if committed:
+                reason = (
+                    f"{committed:.3f}Δ already in flight covers the "
+                    f"{abs(view.book.net_delta):.3f}Δ exposure; nothing further to send"
+                )
             return {
                 "hedged": False,
-                "reason": (
-                    f"|Δ| {abs(view.book.net_delta):.3f} is inside the "
-                    f"{env.delta_drift_threshold:.2f} drift cap"
-                ),
+                "reason": reason,
                 "net_delta": view.book.net_delta,
+                "in_flight": in_flight,
                 "intents": [],
             }
 
@@ -586,7 +812,7 @@ class MagnoTools:
                     symbol=intent.underlying,
                     qty=intent.qty,
                     side=intent.side,
-                    client_order_id=f"magno-hedge-{datetime.now(timezone.utc).timestamp():.0f}",
+                    client_order_id=_order_id("hdg"),
                 )
             except BrokerError as exc:
                 audit.error(
@@ -598,14 +824,28 @@ class MagnoTools:
                 executed.append({"intent": intent.as_dict(), "submitted": False, "error": str(exc)})
                 continue
 
-            audit.success(
-                EventCategory.HEDGE,
-                f"Hedge filled — {intent.side.upper()} {intent.qty:.3f} {intent.underlying}",
-                f"δ {intent.net_delta_before:+.3f} → {intent.projected_delta_after:+.4f} "
-                f"(${intent.notional:,.2f} notional)",
-                intent=intent.as_dict(),
-                order=order,
-            )
+            # An accepted order is not a filled order. Reporting submission as
+            # a fill is what made the runaway invisible in the ledger: nine
+            # stacked shorts each logged "Hedge filled" while none had.
+            status = str(order.get("status", "")).lower()
+            filled_qty = float(order.get("filled_qty") or 0.0)
+            if status == "filled" and filled_qty > 0:
+                audit.success(
+                    EventCategory.HEDGE,
+                    f"Hedge FILLED — {intent.side.upper()} {filled_qty:.3f} {intent.underlying}",
+                    f"δ {intent.net_delta_before:+.3f} → {intent.projected_delta_after:+.4f} "
+                    f"at ${order.get('filled_avg_price') or intent.spot:,.2f}",
+                    intent=intent.as_dict(), order=order,
+                )
+            else:
+                audit.info(
+                    EventCategory.HEDGE,
+                    f"Hedge SUBMITTED — {intent.side.upper()} {intent.qty:.3f} {intent.underlying}",
+                    f"status {status or 'accepted'} · order {str(order.get('id'))[:8]} · "
+                    f"${intent.notional:,.2f} notional. Counted as in-flight until it fills; "
+                    f"no further hedge will be sent for this exposure.",
+                    intent=intent.as_dict(), order=order,
+                )
             executed.append({"intent": intent.as_dict(), "submitted": True, "order": order})
 
         return {

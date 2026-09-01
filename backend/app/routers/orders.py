@@ -162,6 +162,46 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
     except BrokerError as exc:
         probes.append({"probe": "option_order_outside_hours", "accepted": False, "error": str(exc)})
 
+    # Multi-leg is the one path a normal session will never exercise on its own:
+    # the sell side is what builds spreads, and it may be disabled or simply
+    # never signal. Probe it explicitly rather than discovering MLEG rejection
+    # during a judged run.
+    try:
+        from ..quant.spreads import build_vertical
+
+        chain = await state.broker.get_chain("SPY", min_dte=5, max_dte=60, moneyness_band=0.08)
+        short_pick = next(
+            (c for c in sorted(chain, key=lambda c: abs(c.moneyness))
+             if c.right == "C" and c.bid and c.ask and c.mid),
+            None,
+        )
+        spread = build_vertical(short_pick, chain, contracts=1) if short_pick else None
+        if spread is None or spread.net_credit is None:
+            probes.append({
+                "probe": "multi_leg_vertical",
+                "expectation": "unknown — MLEG has never reached Alpaca",
+                "accepted": False,
+                "error": "Could not assemble a quotable vertical to probe with.",
+            })
+        else:
+            # Deliberately unfillable: ask far more credit than the spread is
+            # worth, so it rests and is cancelled rather than filling.
+            unfillable = round((spread.net_credit + spread.width) * 2, 2)
+            await probe(
+                "multi_leg_vertical",
+                "unknown — MLEG has never reached Alpaca",
+                state.broker.submit_vertical_spread(
+                    short_symbol=spread.short_leg.symbol,
+                    long_symbol=spread.long_leg.symbol,
+                    qty=1,
+                    limit_credit=unfillable,
+                    client_order_id=f"magno-pre-m-{datetime.now(timezone.utc).timestamp():.0f}",
+                ),
+            )
+            probes[-1]["structure"] = spread.as_dict()
+    except BrokerError as exc:
+        probes.append({"probe": "multi_leg_vertical", "accepted": False, "error": str(exc)})
+
     # Clean up anything that rested.
     cancelled = []
     for order_id in submitted_ids:
