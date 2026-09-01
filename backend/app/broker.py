@@ -41,7 +41,6 @@ from alpaca.trading.enums import (
     OrderClass,
     OrderSide,
     OrderStatus,
-    PositionIntent,
     QueryOrderStatus,
     TimeInForce,
 )
@@ -650,6 +649,14 @@ class AlpacaBroker:
 
         ``limit_credit`` is the net credit per share. Alpaca expresses a
         multi-leg credit as a negative limit price.
+
+        ``position_intent`` is deliberately omitted. Specifying it explicitly is
+        rejected -- a live probe on a flat account returned ``position intent
+        mismatch, inferred: sell_to_close, specified: sell_to_open`` (422).
+        Alpaca derives intent from the legs and the existing book, and
+        disagreeing with its inference fails the order outright. Letting it
+        infer is also more robust: the same call then works whether the spread
+        is being opened or closed.
         """
         request = LimitOrderRequest(
             qty=int(abs(qty)),
@@ -659,16 +666,10 @@ class AlpacaBroker:
             client_order_id=client_order_id,
             legs=[
                 OptionLegRequest(
-                    symbol=short_symbol.upper(),
-                    ratio_qty=1,
-                    side=OrderSide.SELL,
-                    position_intent=PositionIntent.SELL_TO_OPEN,
+                    symbol=short_symbol.upper(), ratio_qty=1, side=OrderSide.SELL
                 ),
                 OptionLegRequest(
-                    symbol=long_symbol.upper(),
-                    ratio_qty=1,
-                    side=OrderSide.BUY,
-                    position_intent=PositionIntent.BUY_TO_OPEN,
+                    symbol=long_symbol.upper(), ratio_qty=1, side=OrderSide.BUY
                 ),
             ],
         )

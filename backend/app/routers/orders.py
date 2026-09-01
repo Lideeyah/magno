@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -97,6 +99,9 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         "Probing the live Alpaca order path with cancellable test orders.",
     )
 
+    def _pid(tag: str) -> str:
+        return f"magno-pre-{tag}-{datetime.now(timezone.utc):%H%M%S}-{secrets.token_hex(2)}"
+
     probes: list[dict] = []
     submitted_ids: list[str] = []
 
@@ -129,18 +134,78 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
     # Smallest quantity that clears Alpaca's $1 minimum notional, with headroom.
     qty = round(max(0.01, 2.0 / spot), 3) if spot else 0.01
 
+    async def settle(index: int) -> None:
+        """Poll a probe order until it resolves. `accepted` is not an answer."""
+        entry = probes[index]
+        if not entry.get("accepted") or not entry.get("order_id"):
+            return
+        entry["settled_status"] = "still resting after 10s"
+        for _ in range(10):
+            await asyncio.sleep(1.0)
+            try:
+                current = next(
+                    (o for o in await state.broker.get_recent_orders(limit=30)
+                     if o["id"] == entry["order_id"]),
+                    None,
+                )
+            except BrokerError:
+                return
+            if current and str(current.get("status", "")).lower() not in (
+                "pending_new", "new", "accepted"
+            ):
+                entry["settled_status"] = current.get("status")
+                entry["settled_filled_qty"] = current.get("filled_qty")
+                return
+
+    async def spy_equity_qty() -> float:
+        for pos in await state.broker.get_positions():
+            if pos.symbol.upper() == "SPY" and not pos.is_option:
+                return pos.qty
+        return 0.0
+
+    # --- 1. Fractional SHORT, from a flat book -------------------------------
+    # Order matters. A previous run bought first, so the subsequent sell may
+    # have been closing that long rather than opening a short -- which left the
+    # question unanswered. Selling first, from flat, makes a resulting negative
+    # position unambiguous proof.
+    starting_qty = await spy_equity_qty()
+    await probe(
+        "fractional_equity_short_sell",
+        "unknown — a resulting negative position is the only proof",
+        state.broker.submit_equity_order("SPY", qty, "sell", client_order_id=_pid("s")),
+    )
+    await settle(len(probes) - 1)
+    after_short = await spy_equity_qty()
+    probes[-1]["position_before"] = starting_qty
+    probes[-1]["position_after"] = after_short
+    probes[-1]["genuine_short"] = after_short < starting_qty and after_short < 0
+
+    # --- 2. Fractional BUY, which also flattens the short above --------------
     await probe(
         "fractional_equity_buy",
         "accepted — fractional long is permitted",
-        state.broker.submit_equity_order("SPY", qty, "buy", client_order_id=f"magno-pre-b-{datetime.now(timezone.utc).timestamp():.0f}"),
+        state.broker.submit_equity_order("SPY", qty, "buy", client_order_id=_pid("b")),
     )
-    await probe(
-        "fractional_equity_short_sell",
-        "rejected — Alpaca does not permit fractional short sales",
-        state.broker.submit_equity_order("SPY", qty, "sell", client_order_id=f"magno-pre-s-{datetime.now(timezone.utc).timestamp():.0f}"),
-    )
+    await settle(len(probes) - 1)
 
-    # A real, currently-quotable contract, priced the way the agent would.
+    # A market buy cannot be made unfillable, so this one genuinely executes and
+    # must be unwound explicitly. Closing a fractional *long* is permitted --
+    # only opening a fractional short is not -- so this always flattens.
+    if await spy_equity_qty() > 0:
+        try:
+            unwind = await state.broker.close_position("SPY")
+            probes[-1]["unwound"] = unwind.get("id")
+        except BrokerError as exc:
+            probes[-1]["unwind_error"] = str(exc)
+        for _ in range(8):
+            await asyncio.sleep(1.0)
+            if abs(await spy_equity_qty()) < 1e-6:
+                break
+
+    # --- 3. Options order ----------------------------------------------------
+    # Deliberately far below the bid so it rests and is cancelled. An earlier
+    # version priced this marketable, so it filled instantly and cancellation
+    # was a no-op -- leaving two unwanted 7 DTE calls on the account.
     option_symbol = None
     try:
         chain = await state.broker.get_chain("SPY", min_dte=5, max_dte=60, moneyness_band=0.05)
@@ -148,24 +213,21 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         if quotable:
             pick = min(quotable, key=lambda c: abs(c.moneyness))
             option_symbol = pick.symbol
-            from ..broker import option_tick, round_to_tick
+            from ..broker import round_to_tick
 
-            limit = round_to_tick(pick.ask + option_tick(pick.ask), up=True)
+            unfillable = round_to_tick(max(0.01, pick.bid * 0.5), up=False)
             await probe(
-                "option_order_outside_hours",
-                "unknown — this is what we are here to find out",
+                "option_order_unfillable_limit",
+                "accepted and left resting — must not fill",
                 state.broker.submit_option_order(
-                    pick.symbol, 1, "buy", limit_price=limit,
-                    client_order_id=f"magno-pre-o-{datetime.now(timezone.utc).timestamp():.0f}",
+                    pick.symbol, 1, "buy", limit_price=unfillable,
+                    client_order_id=_pid("o"),
                 ),
             )
     except BrokerError as exc:
-        probes.append({"probe": "option_order_outside_hours", "accepted": False, "error": str(exc)})
+        probes.append({"probe": "option_order_unfillable_limit", "accepted": False, "error": str(exc)})
 
-    # Multi-leg is the one path a normal session will never exercise on its own:
-    # the sell side is what builds spreads, and it may be disabled or simply
-    # never signal. Probe it explicitly rather than discovering MLEG rejection
-    # during a judged run.
+    # --- 4. Multi-leg vertical ----------------------------------------------
     try:
         from ..quant.spreads import build_vertical
 
@@ -178,24 +240,19 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         spread = build_vertical(short_pick, chain, contracts=1) if short_pick else None
         if spread is None or spread.net_credit is None:
             probes.append({
-                "probe": "multi_leg_vertical",
-                "expectation": "unknown — MLEG has never reached Alpaca",
-                "accepted": False,
+                "probe": "multi_leg_vertical", "accepted": False,
                 "error": "Could not assemble a quotable vertical to probe with.",
             })
         else:
-            # Deliberately unfillable: ask far more credit than the spread is
-            # worth, so it rests and is cancelled rather than filling.
+            # Demand far more credit than the structure is worth, so it rests.
             unfillable = round((spread.net_credit + spread.width) * 2, 2)
             await probe(
                 "multi_leg_vertical",
-                "unknown — MLEG has never reached Alpaca",
+                "accepted and left resting — position_intent must be inferred",
                 state.broker.submit_vertical_spread(
                     short_symbol=spread.short_leg.symbol,
                     long_symbol=spread.long_leg.symbol,
-                    qty=1,
-                    limit_credit=unfillable,
-                    client_order_id=f"magno-pre-m-{datetime.now(timezone.utc).timestamp():.0f}",
+                    qty=1, limit_credit=unfillable, client_order_id=_pid("m"),
                 ),
             )
             probes[-1]["structure"] = spread.as_dict()
@@ -218,9 +275,17 @@ async def preflight(state: SessionState = Depends(require_session)) -> dict:
         f"{len(cancelled)} order(s) cancelled.",
         probes=probes,
     )
+    residual = await spy_equity_qty()
+    residual_options = [
+        p.symbol for p in await state.broker.get_positions()
+        if p.is_option and p.underlying == "SPY"
+    ]
     return {
         "spot": spot,
         "probe_qty": qty,
+        "residual_spy_shares": residual,
+        "residual_spy_options": residual_options,
+        "clean": abs(residual) < 1e-6 and not residual_options,
         "option_symbol": option_symbol,
         "probes": probes,
         "cancelled": cancelled,
