@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Magno is a single-theme product: an institutional dark terminal. The palette
+ * is committed to deliberately rather than swapped by preference — traders run
+ * these screens in dark rooms for hours, and a light variant would be a
+ * different product. Colours are still tokenised so nothing hardcodes a hex.
+ */
+:root {
+  color-scheme: dark;
+
+  --background: #080a0f;
+  --surface: #0e121b;
+  --surface-raised: #141926;
+  --border: #1e2536;
+  --border-strong: #2a3348;
+  --foreground: #f1f5f9;
+  --muted: #8a97ad;
+  --subtle: #5b6880;
+  --accent: #2563eb;
+  --accent-bright: #3b82f6;
+  --accent-dim: #1d3a8a;
+  --positive: #34d399;
+  --negative: #ef4444;
+  --warning: #f59e0b;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* One focus treatment across the whole product, in the brand accent. */
+  :focus-visible {
+    outline: 2px solid var(--accent-bright);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background: var(--accent-dim);
+    color: var(--foreground);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--background);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 8px;
+    border: 2px solid var(--background);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--subtle);
+  }
+}
+
+@layer components {
+  /* Every numeric readout in the product. Tabular figures stop digits from
+     shifting horizontally as values tick, which is what makes a live number
+     feel stable rather than twitchy. */
+  .num {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1, "zero" 1;
+  }
+
+  .panel {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+  }
+
+  /* Column-header treatment shared by every data table. */
+  .th {
+    font-size: 0.6875rem;
+    line-height: 1rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--subtle);
+    font-weight: 500;
+  }
+
+  .hairline {
+    background-image: linear-gradient(
+      to right,
+      transparent,
+      var(--border),
+      transparent
+    );
+  }
+}
+
+/* Motion is opt-in. Under reduced-motion everything resolves instantly rather
+   than merely faster — a shortened animation is still motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
