@@ -93,6 +93,16 @@ async def create_session(payload: OnboardRequest) -> dict:
     if payload.min_dte >= payload.max_dte:
         raise HTTPException(status_code=422, detail="min_dte must be less than max_dte.")
 
+    # The entry window must clear the exit engine's time stop. Overlap means
+    # every position opened inside the band is closed on the next tick, paying
+    # the spread twice for no exposure.
+    from ..quant.exit_rules import ExitPolicy
+    from ..quant.risk_gate import validate_dte_against_exit
+
+    coherence = validate_dte_against_exit(payload.min_dte, ExitPolicy().time_stop_dte)
+    if not coherence.ok:
+        raise HTTPException(status_code=422, detail=coherence.message)
+
     try:
         broker = AlpacaBroker(payload.api_key.strip(), payload.secret_key.strip())
         account = await broker.get_account()
@@ -199,6 +209,10 @@ class EnvelopeUpdate(BaseModel):
     contract_qty: int | None = Field(default=None, ge=1, le=50)
     iv_rank_sell_at: float | None = Field(default=None, ge=0, le=100)
     iv_rank_buy_at: float | None = Field(default=None, ge=0, le=100)
+    # Patchable at runtime: the entry window needed a correction mid-session and
+    # a restart drops every live session.
+    min_dte: float | None = Field(default=None, ge=0, le=400)
+    max_dte: float | None = Field(default=None, ge=1, le=800)
 
 
 @router.patch("/envelope")
@@ -210,8 +224,19 @@ async def update_envelope(
 
     changes = payload.model_dump(exclude_none=True)
     contract_qty = changes.pop("contract_qty", None)
+
     if changes:
-        state.envelope = replace(state.envelope, **changes)
+        candidate = replace(state.envelope, **changes)
+        if candidate.min_dte >= candidate.max_dte:
+            raise HTTPException(status_code=422, detail="min_dte must be less than max_dte.")
+        from ..quant.risk_gate import validate_dte_against_exit
+
+        coherence = validate_dte_against_exit(
+            candidate.min_dte, state.exit_policy.time_stop_dte
+        )
+        if not coherence.ok:
+            raise HTTPException(status_code=422, detail=coherence.message)
+        state.envelope = candidate
     if contract_qty is not None:
         state.contract_qty = contract_qty
 

@@ -68,7 +68,7 @@ const DEFAULT_ENVELOPE: EnvelopeForm = {
   max_daily_loss_pct: 0.05,
   max_open_positions: 6,
   contract_qty: 1,
-  min_dte: 5,
+  min_dte: 28,
   max_dte: 60,
 };
 
@@ -515,7 +515,7 @@ export default function OnboardingPage() {
                 label="Min days to expiry"
                 htmlFor="min-dte"
                 error={dteInvalid ? "Must be below the maximum." : undefined}
-                hint="Below this, pin and gamma risk dominate."
+                hint="Must stay clear of the 21-day exit time stop, or positions close the moment they open."
               >
                 <Input
                   id="min-dte"

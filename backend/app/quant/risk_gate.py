@@ -91,7 +91,15 @@ class RiskEnvelope:
     delta_drift_threshold: float = 1.0
     max_daily_loss_pct: float = 0.05
     max_open_positions: int = 6
-    min_dte: float = 5.0
+    # The entry floor must sit clear of the exit engine's time stop, or the
+    # two rules fight: a position opened inside the time-stop window is closed
+    # on the very next tick, round-tripping the spread for nothing. Observed
+    # live -- a 17.2 DTE put was bought at 4.85 and stopped out at 4.75 one
+    # second later, and would have repeated once a minute.
+    #
+    # 28 gives a position a full week of life before the 21-day stop can reach
+    # it. `validate_dte_against_exit` enforces the relationship.
+    min_dte: float = 28.0
     max_dte: float = 60.0
     min_open_interest: int = 100
     min_option_price: float = 0.10
@@ -341,6 +349,34 @@ def validate_daily_loss(day_pnl: float, equity_at_open: float, max_loss_pct: flo
         f"Day drawdown {max(loss_pct, 0.0):.2%} under {max_loss_pct:.0%} breaker",
         observed=max(loss_pct, 0.0),
         limit=max_loss_pct,
+    )
+
+
+def validate_dte_against_exit(min_dte: float, time_stop_dte: float) -> Check:
+    """The entry window and the exit time stop must not overlap.
+
+    Two rules that are each individually sensible can be jointly incoherent.
+    Entering at 5 DTE is defensible; closing at 21 DTE is defensible; doing
+    both means every trade inside that band is opened and immediately closed,
+    paying the spread twice for no exposure. This makes the relationship a
+    checked invariant rather than a coincidence of defaults.
+    """
+    if min_dte <= time_stop_dte:
+        return Check(
+            "DTE_WINDOW_CONFLICT",
+            Verdict.REJECT,
+            f"Entry floor {min_dte:.0f} DTE is at or inside the {time_stop_dte:.0f}d "
+            f"exit time stop; every position opened would be closed immediately",
+            observed=min_dte,
+            limit=time_stop_dte,
+        )
+    return Check(
+        "DTE_WINDOW_OK",
+        Verdict.PASS,
+        f"Entry floor {min_dte:.0f} DTE clears the {time_stop_dte:.0f}d time stop "
+        f"by {min_dte - time_stop_dte:.0f} days",
+        observed=min_dte,
+        limit=time_stop_dte,
     )
 
 

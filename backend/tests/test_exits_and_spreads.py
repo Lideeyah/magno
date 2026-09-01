@@ -392,3 +392,41 @@ def test_in_flight_is_included_in_the_fractional_short_decision():
     )
     result = intents(book, {"NVDA": -5.0})
     assert result and result[0].qty % 1 == 0
+
+
+# --------------------------------------------------------------------------- #
+# Entry / exit window coherence
+#
+# Found live. Entering at 5 DTE is defensible. Closing at 21 DTE is defensible.
+# Doing both means every position opened inside that band is closed on the next
+# tick — a 17.2 DTE put was bought at 4.85 and stopped out at 4.75 one second
+# later, and would have repeated once a minute. Two individually sensible rules,
+# jointly incoherent.
+# --------------------------------------------------------------------------- #
+from app.quant.risk_gate import validate_dte_against_exit  # noqa: E402
+
+
+def test_overlapping_entry_and_exit_windows_are_rejected():
+    check = validate_dte_against_exit(min_dte=5.0, time_stop_dte=21.0)
+    assert not check.ok and check.code == "DTE_WINDOW_CONFLICT"
+
+
+def test_entry_floor_equal_to_the_time_stop_is_rejected():
+    """Equal means a position is closable the instant it opens."""
+    assert not validate_dte_against_exit(21.0, 21.0).ok
+
+
+def test_entry_floor_clear_of_the_time_stop_passes():
+    assert validate_dte_against_exit(28.0, 21.0).ok
+
+
+def test_default_envelope_and_default_exit_policy_are_coherent():
+    """The shipped defaults must not fight each other."""
+    assert validate_dte_against_exit(RiskEnvelope().min_dte, ExitPolicy().time_stop_dte).ok
+
+
+def test_a_freshly_entered_position_is_not_immediately_exitable():
+    """End to end: a contract at the entry floor survives the exit engine."""
+    env, policy = RiskEnvelope(), ExitPolicy()
+    fresh = option(1, 2.00, 2.00, dte=env.min_dte)
+    assert not evaluate_exit(fresh, policy).should_close
