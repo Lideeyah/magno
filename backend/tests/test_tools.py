@@ -113,6 +113,9 @@ def make_contract(
     occ = parse_occ(symbol)
     assert occ is not None
     mid = (bid + ask) / 2
+    # A contract with no two-sided quote is a real state — an illiquid wing, a
+    # halted series — so the helper must be able to represent one.
+    spread = ((ask - bid) / mid) if mid > 0 else None
     greeks = bs_greeks(SPOT, strike, occ.year_fraction(), settings.risk_free_rate, 0.20, right == "C")
     return ChainContract(
         symbol=symbol,
@@ -121,11 +124,11 @@ def make_contract(
         strike=strike,
         expiry=occ.expiry.isoformat(),
         dte=occ.days_to_expiry(),
-        bid=bid,
-        ask=ask,
-        mid=mid,
-        last=mid,
-        spread_pct=(ask - bid) / mid,
+        bid=bid or None,
+        ask=ask or None,
+        mid=mid or None,
+        last=mid or None,
+        spread_pct=spread,
         open_interest=open_interest,
         iv=0.20,
         iv_source="magno_bsm",

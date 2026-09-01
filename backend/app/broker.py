@@ -38,8 +38,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     AssetStatus,
     ContractType,
+    OrderClass,
     OrderSide,
     OrderStatus,
+    PositionIntent,
     QueryOrderStatus,
     TimeInForce,
 )
@@ -48,6 +50,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    OptionLegRequest,
 )
 
 from .config import settings
@@ -628,6 +631,47 @@ class AlpacaBroker:
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_order_id,
             )
+        return await self._submit(request)
+
+    async def submit_vertical_spread(
+        self,
+        short_symbol: str,
+        long_symbol: str,
+        qty: int,
+        limit_credit: float,
+        client_order_id: str | None = None,
+    ) -> dict:
+        """Submit both legs of a credit vertical as one atomic package.
+
+        Legging in separately is the failure mode this exists to avoid: if the
+        short fills and the long does not, the account is holding naked risk —
+        precisely the thing the spread was built to prevent. Alpaca's MLEG order
+        class fills both legs or neither.
+
+        ``limit_credit`` is the net credit per share. Alpaca expresses a
+        multi-leg credit as a negative limit price.
+        """
+        request = LimitOrderRequest(
+            qty=int(abs(qty)),
+            order_class=OrderClass.MLEG,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(abs(limit_credit), 2) * -1,
+            client_order_id=client_order_id,
+            legs=[
+                OptionLegRequest(
+                    symbol=short_symbol.upper(),
+                    ratio_qty=1,
+                    side=OrderSide.SELL,
+                    position_intent=PositionIntent.SELL_TO_OPEN,
+                ),
+                OptionLegRequest(
+                    symbol=long_symbol.upper(),
+                    ratio_qty=1,
+                    side=OrderSide.BUY,
+                    position_intent=PositionIntent.BUY_TO_OPEN,
+                ),
+            ],
+        )
         return await self._submit(request)
 
     async def _submit(self, request) -> dict:
