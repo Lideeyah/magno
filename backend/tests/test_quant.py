@@ -691,10 +691,40 @@ def test_the_short_is_opened_on_the_following_cycle_from_flat():
     assert qty % 1 == 0
 
 
-def test_buying_through_zero_is_also_capped():
-    """Symmetric: covering a short and going long stays one side of zero."""
+def test_buying_through_zero_is_capped_at_the_short_size():
+    """Symmetric to the sell case, and the assertion that was too weak.
+
+    Covering a 12-share short with a 30-share buy would leave 18 long — the
+    order crosses zero and Alpaca refuses it as "insufficient qty available".
+    The earlier version asserted `qty <= 30.0`, which the buggy code satisfied
+    trivially, so the bug shipped and surfaced live at 50.516 against 50.
+    """
     qty = hedge_quantity(net_delta=-30.0, equity_held=-12.0)
-    assert qty <= 30.0
+    assert qty == pytest.approx(12.0), "buy crossed zero"
+    assert -12.0 + qty == pytest.approx(0.0), "should land exactly flat"
+
+
+def test_the_long_is_opened_on_the_following_cycle_from_flat():
+    remaining = 30.0 - 12.0
+    assert hedge_quantity(net_delta=-remaining, equity_held=0.0) == pytest.approx(18.0)
+
+
+def test_buying_to_partially_cover_a_short_keeps_precision():
+    """Not crossing zero, so fractional stands."""
+    assert hedge_quantity(net_delta=-5.5, equity_held=-20.0) == pytest.approx(5.5)
+
+
+@pytest.mark.parametrize(
+    "held,net",
+    [(-50.0, -50.516), (-12.0, -30.0), (0.0, -7.3), (-20.0, -5.5), (41.295, 48.966), (10.0, 25.5)],
+)
+def test_no_hedge_order_crosses_zero_in_either_direction(held, net):
+    qty = hedge_quantity(net, held)
+    resulting = held + (qty if net < 0 else -qty)
+    if held > 0:
+        assert resulting >= -1e-9, f"sell crossed zero: {held} -> {resulting}"
+    elif held < 0:
+        assert resulting <= 1e-9, f"buy crossed zero: {held} -> {resulting}"
 
 
 @pytest.mark.parametrize("held,net", [(41.295, 48.966), (10.0, 25.5), (0.5, 3.2), (100.0, 100.7)])

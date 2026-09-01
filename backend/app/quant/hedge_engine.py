@@ -248,8 +248,17 @@ def hedge_quantity(net_delta: float, equity_held: float) -> float:
     """
     qty = abs(net_delta)
     side_is_sell = net_delta > 0
+
     if not side_is_sell:
-        # Buying: fractional is always fine, whether opening a long or covering.
+        # Buying. Fractional quantities are permitted, but an order still may
+        # not cross through zero -- covering a short by more than the short
+        # itself is refused:
+        #     40310000 insufficient qty available for order
+        #     (requested: 50.516, available: 50)
+        # observed live while buying 50.516 against a 50-share short. The
+        # earlier guard only capped sells; this is the same rule mirrored.
+        if equity_held < 0 and qty > -equity_held:
+            return round_qty(-equity_held)
         return round_qty(qty)
 
     resulting = equity_held - qty
