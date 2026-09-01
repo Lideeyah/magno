@@ -22,3 +22,7 @@ next-env.d.ts
 .DS_Store
 .idea/
 .vscode/
+
+# Isolated demo sandbox build output
+.next-demo/
+.env.demo
