@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowDownToLine,
   Brain,
+  Trash2,
   CircleDot,
   Magnet,
   Radar,
@@ -151,12 +152,16 @@ function EventRow({ event }: { event: AuditEvent }) {
 function ExecutionAuditStreamImpl({
   events,
   connected,
+  onClear,
   className,
 }: {
   events: AuditEvent[];
   connected: boolean;
+  /** Wipes the ledger. Positions and orders are untouched. */
+  onClear?: () => void;
   className?: string;
 }) {
+  const [clearing, setClearing] = React.useState(false);
   const [filter, setFilter] = React.useState<"all" | EventCategory>("all");
   const [pinned, setPinned] = React.useState(true);
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -194,12 +199,36 @@ function ExecutionAuditStreamImpl({
       className={className}
       bodyClassName="flex min-h-0 flex-col"
       action={
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-2">
           <Activity
             className={cn("h-3 w-3", connected ? "text-positive" : "text-subtle")}
             aria-hidden="true"
           />
           <span className="num text-2xs text-subtle">{events.length}</span>
+          {onClear && (
+            <button
+              type="button"
+              onClick={async () => {
+                setClearing(true);
+                try {
+                  await onClear();
+                } finally {
+                  setClearing(false);
+                }
+              }}
+              disabled={clearing || events.length === 0}
+              title="Clear the execution ledger. Positions and orders are unaffected."
+              aria-label="Clear execution stream"
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-control text-subtle",
+                "transition-colors duration-100 ease-enter",
+                "hover:bg-surface-raised hover:text-negative",
+                "disabled:pointer-events-none disabled:opacity-40",
+              )}
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          )}
         </div>
       }
     >

@@ -185,6 +185,22 @@ async def get_events(limit: int = 150, state: SessionState = Depends(require_ses
     return {"events": state.audit.recent(min(max(limit, 1), 500))}
 
 
+@router.delete("/events")
+async def clear_events(state: SessionState = Depends(require_session)) -> dict:
+    """Wipe the execution ledger for a clean slate.
+
+    Only the record is cleared — positions, orders and the risk envelope are
+    untouched. The agent keeps running if it is running.
+    """
+    dropped = state.audit.clear()
+    state.audit.info(
+        EventCategory.SYSTEM,
+        "Ledger cleared",
+        f"{dropped} event(s) removed by the operator. Positions and orders are unaffected.",
+    )
+    return {"cleared": dropped}
+
+
 class AutopilotRequest(BaseModel):
     enabled: bool
 

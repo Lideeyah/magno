@@ -31,7 +31,7 @@ const MAX_SAMPLES = 900; // ~15 minutes at 1 Hz
 
 export default function TerminalPage() {
   const router = useRouter();
-  const { frame, events, status, error, reconnect } = useTelemetry();
+  const { frame, events, status, error, reconnect, clearEvents } = useTelemetry();
 
   const [samples, setSamples] = React.useState<CurveSample[]>([]);
   const [shockOpen, setShockOpen] = React.useState(false);
@@ -137,6 +137,21 @@ export default function TerminalPage() {
       showNotice(err instanceof ApiError ? err.message : "Dry run failed.");
     } finally {
       setBusy(null);
+    }
+  };
+
+  const clearLedger = async () => {
+    try {
+      const { cleared } = await api.clearEvents();
+      // Server-side and client-side are separate stores; both must go.
+      clearEvents();
+      showNotice(
+        cleared
+          ? `Ledger cleared — ${cleared} event(s) removed. Positions untouched.`
+          : "Ledger was already empty.",
+      );
+    } catch (err) {
+      showNotice(err instanceof ApiError ? err.message : "Could not clear the ledger.");
     }
   };
 
@@ -454,6 +469,7 @@ export default function TerminalPage() {
           <ExecutionAuditStream
             events={events}
             connected={connected}
+            onClear={clearLedger}
             className="min-h-[26rem] flex-1"
           />
         </div>

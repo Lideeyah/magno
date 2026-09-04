@@ -174,6 +174,14 @@ export function useTelemetry() {
 
   const reconnect = useCallback(() => reconnectRef.current(), []);
 
+  /** Drop the client's copy of the ledger.
+   *
+   * Clearing server-side is not enough on its own: the hook merges by sequence
+   * number and keeps its own list, so rows the server has forgotten would stay
+   * on screen until the tab reloaded.
+   */
+  const clearEvents = useCallback(() => setEvents([]), []);
+
   /** Optimistically append a locally generated note to the ledger. */
   const pushLocalEvent = useCallback(
     (event: Omit<AuditEvent, "seq" | "ts"> & Partial<Pick<AuditEvent, "ts">>) => {
@@ -190,5 +198,5 @@ export function useTelemetry() {
     [mergeEvents],
   );
 
-  return { frame, events, status, error, reconnect, pushLocalEvent };
+  return { frame, events, status, error, reconnect, clearEvents, pushLocalEvent };
 }

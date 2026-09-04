@@ -114,6 +114,17 @@ class AuditLog:
     def reject(self, category: EventCategory, title: str, detail: str = "", **data: Any) -> AuditEvent:
         return self.emit(category, EventLevel.REJECT, title, detail, **data)
 
+    def clear(self) -> int:
+        """Drop every recorded event and start a fresh ledger.
+
+        The sequence counter is module-global and keeps climbing, so ids never
+        collide with anything a client is still holding — a stale row cannot
+        reappear by matching the seq of a new one.
+        """
+        dropped = len(self._events)
+        self._events.clear()
+        return dropped
+
     def recent(self, limit: int = 120) -> list[dict]:
         events = list(self._events)[-limit:]
         return [e.as_dict() for e in events]

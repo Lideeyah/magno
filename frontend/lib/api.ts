@@ -169,6 +169,8 @@ export const api = {
 
   events: (limit = 150) => request<{ events: AuditEvent[] }>(`/api/events?limit=${limit}`),
 
+  clearEvents: () => request<{ cleared: number }>("/api/events", { method: "DELETE" }),
+
   greeks: () =>
     request<{ greeks: PortfolioGreeks; positions: unknown[] }>("/api/greeks"),
 
