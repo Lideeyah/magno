@@ -1,0 +1,17 @@
+# The root build context is the whole repo, so everything the image does not
+# need has to be excluded explicitly -- above all, credentials.
+**/.env
+**/.env.*
+!**/.env.example
+
+frontend/
+.git/
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.next/
+**/.next-*/
+backend/tests/
+backend/requirements-dev.txt
