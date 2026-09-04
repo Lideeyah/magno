@@ -72,6 +72,14 @@ def get_settings() -> Settings:
     settings = Settings()
     if universe_env:
         settings.universe = [s.strip().upper() for s in universe_env.split(",") if s.strip()]
+    # Deployed frontends live on a domain the image cannot know at build time,
+    # so the allowed origins are supplied at boot. Localhost stays permitted by
+    # the regex in main.py, which keeps local development working unchanged.
+    origins_env = os.getenv("MAGNO_CORS_ORIGINS")
+    if origins_env:
+        settings.cors_origins = [
+            o.strip().rstrip("/") for o in origins_env.split(",") if o.strip()
+        ]
     return settings
 
 

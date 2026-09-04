@@ -1,0 +1,11 @@
+# Credentials must never enter an image layer.
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+requirements-dev.txt
