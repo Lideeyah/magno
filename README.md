@@ -1,266 +1,156 @@
 # Magno
 
-**Autonomous options trading and delta-neutral hedging on Alpaca paper trading.**
+**Autonomous volatility harvesting with a magnetic delta restoring force.**
 
-Magno runs an options book without a human in the loop. A language model served
-by **Featherless AI** proposes the trade; nine deterministic risk gates decide
-whether it happens; portfolio delta is pulled back to zero continuously with
-fractional equity orders.
+Magno runs an options book on Alpaca paper trading and holds it delta-neutral in real time. It scans the volatility surface, prices every contract locally, proposes trades through a bounded language model, and refuses to route anything that fails nine deterministic arithmetic gates. Every decision it makes is written to an append-only ledger you can read top to bottom and reconstruct without opening the source.
 
-Built for the Alpaca AI Trading Agents Hackathon — *Options Alpha Agents* track.
-
----
-
-## The one-paragraph version
-
-Every 60 seconds the agent scans SPY, QQQ, NVDA and AAPL: it pulls live option
-chains, inverts implied volatility from the NBBO mid, and ranks each name by
-where its ATM IV sits against a year of realised volatility. Contracts that pass
-every pre-trade gate become a closed menu presented to the model — which can
-only pick from that menu, so a hallucinated symbol can never become an order.
-The chosen trade is re-gated against a *fresh* quote at submit time and sent as
-a marketable limit. Separately, every 5 seconds, the hedge engine recomputes
-share-equivalent delta per underlying and neutralises anything past the drift
-cap with fractional equity orders sized to three decimal places.
-
-**The model proposes. Arithmetic disposes.**
+**Live app →** https://magno-lideeyahs-projects.vercel.app
+**API →** https://magno-v387.onrender.com/health
+**Repository →** https://github.com/Lideeyah/magno
 
 ---
 
-## Quick start
+## The idea
 
-Two terminals. The backend needs no credentials to boot — you supply Alpaca
-paper keys through the onboarding UI.
+An options book drifts. Every fill, every tick of the underlying, every hour of decay moves net delta away from zero, and a book that is nominally "market neutral" quietly becomes a directional bet nobody chose to make.
 
-### 1. Backend
+Magno treats that drift the way a magnet treats a displaced needle: as something with a restoring force acting on it. Delta is measured continuously per underlying, and the moment it leaves a bounded envelope an equity hedge pulls it back. The force is arithmetic, not judgement.
+
+---
+
+## Architectural pillars
+
+### 1. Magnetic delta restoring force
+
+Net exposure is computed in share-equivalent terms:
+
+```
+Δ_net = Σ(option δ × contracts × 100) + Σ(shares)
+```
+
+**Bucketed per underlying, never portfolio-wide.** A portfolio-level delta of zero can hide a long NVDA position against a short SPY one — a basis bet nobody sized. Each underlying is hedged against its own delta.
+
+**A bounded envelope, not a target.** Hedging to exactly zero on every tick pays the spread continuously and achieves nothing; the drift cap (±8.0Δ in the tuned configuration) is the width of the band the hedger defends. This was set by measurement, not assertion: at ±1.0Δ the book took 11 fills and $81,013 of turnover; at ±8.0Δ, 6 fills and $74,036 — roughly 45% fewer fills for the same neutrality.
+
+**Fractional equity hedging, with the broker's real constraints encoded.** Two Alpaca rules shape the sizing, and both were established against the live API rather than inferred from documentation:
+
+- Fractional shares **cannot be sold short** — `42210000 fractional orders cannot be sold short`. A short hedge is floored to whole shares.
+- An order **may not cross through zero** — `40310000 insufficient qty available`. Selling out of a long position stops at flat and a second order establishes the short.
+
+```python
+def hedge_quantity(net_delta: float, equity_held: float) -> float:
+    qty = abs(net_delta)
+    if net_delta <= 0:                       # buying
+        if equity_held < 0 and qty > -equity_held:
+            return round_qty(-equity_held)   # buy back to flat, no further
+        return round_qty(qty)
+    if equity_held - qty >= 0:
+        return round_qty(qty)                # selling out of a long
+    if equity_held > 0:
+        return round_qty(equity_held)        # sell to flat, never through it
+    return float(math.floor(qty))            # whole-share short
+```
+
+**In-flight orders count.** A hedge that has been submitted but not filled is still exposure the next cycle must know about, or the agent stacks duplicate hedges against a delta reading that is already being corrected. Effective delta is `Δ_positions + Δ_in_flight`.
+
+### 2. Bounded AI reasoning
+
+Featherless AI (**Qwen/Qwen2.5-72B-Instruct**) reads the volatility surface and proposes an action. It cannot execute anything.
+
+- **Closed menu.** The model selects from a fixed schema of actions on a fixed universe of contracts. There is no free-text path to the broker.
+- **The quant policy is the baseline.** Every prompt carries the deterministic policy's own recommendation. When the model diverges, the divergence is recorded in the ledger — it is not silently accepted or silently discarded.
+- **Arithmetic disposes.** The model's proposal is an input to the risk gates, never a bypass of them. A rejected proposal is logged with the gate that rejected it.
+- **It degrades, it does not fail.** With no Featherless key the agent falls back to the deterministic policy and keeps trading.
+
+Greeks are computed locally with Black-Scholes-Merton and a Newton-Raphson IV inversion (Brenner-Subrahmanyam seed, bisection fallback) rather than read from the broker — Alpaca returns `null` Greeks on unsubscribed paper accounts, so a book that trusted the API would be flying blind.
+
+### 3. Nine deterministic risk gates
+
+Pure functions. No model output reaches the broker without clearing all of them.
+
+| Gate | Rule |
+|---|---|
+| Spread ceiling | bid-ask ≤ 5% of mid |
+| Allocation cap | ≤ 10% of buying power per position |
+| Concentration | bounded open positions per underlying |
+| DTE window | entry ≥ 28 days, ≤ 60 |
+| Liquidity | open interest ≥ 100 |
+| Price band | $0.10 ≤ premium ≤ $40.00 |
+| Delta drift | hedge when \|Δ\| exceeds the envelope |
+| Daily loss breaker | halt at −5% |
+| Market hours | no routing into a closed session |
+
+The DTE window and the exit engine are checked against each other at onboarding. They once overlapped, and the result was a 17.2-DTE put bought at 4.85 and stopped out at 4.75 one second later — a round-trip of the spread for no exposure, repeating once a minute. `validate_dte_against_exit` now makes that state unreachable.
+
+**Exit rules are asymmetric by construction.** A short option can lose many multiples of the premium collected, so it stops at −100%. A long option cannot lose more than it cost, so a −100% stop would never fire; it stops at −50%. Both take profit at +50% and time-stop at 21 DTE.
+
+---
+
+## Live telemetry
+
+- **1 Hz WebSocket** carrying full frames plus events pushed the instant a decision is logged, merged by sequence number so a reconnect cannot duplicate rows.
+- **Per-underlying Greeks isolation** — delta, gamma, theta, vega bucketed rather than aggregated into a single misleading number.
+- **Append-only execution ledger** recording every scan, completion, gate verdict, order, fill and hedge, with `SUBMITTED` and `FILLED` distinguished so an unfilled hedge is never reported as a completed one.
+- **Sessions survive restarts.** Credentials live in process memory and die with the process — which on a free-tier host happens on every idle spin-down. The server issues a Fernet-encrypted resume token the browser holds and posts back; only the server can read it, and a session rebuilds without the operator re-entering keys.
+
+Credentials are never written to disk, never logged, and never returned to the client. The Alpaca client is constructed `paper=True` unconditionally — there is no live-trading code path.
+
+---
+
+## Quickstart
+
+**Backend**
 
 ```bash
 cd backend
-python3.11 -m venv .venv && source .venv/bin/activate   # or: uv venv --python 3.11 .venv
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # add FEATHERLESS_API_KEY for LLM reasoning (optional)
+cp .env.example .env          # add FEATHERLESS_API_KEY; Alpaca keys are entered in the browser
 uvicorn app.main:app --reload --port 8000
 ```
 
-Check it: `curl localhost:8000/health` · API docs at `localhost:8000/docs`
-
-### 2. Frontend
+**Frontend**
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev                   # http://localhost:3000
 ```
 
-Open **http://localhost:3000**, click **Connect paper account**, and paste your
-Alpaca **paper** API key and secret. Magno validates them against
-`paper-api.alpaca.markets`, confirms the $100k baseline, and drops you into the
-terminal.
-
-> If the backend is not on port 8000, set `NEXT_PUBLIC_MAGNO_API` in
-> `frontend/.env.local`.
-
-### 3. Run the tests
+**Tests**
 
 ```bash
-cd backend
-pip install -r requirements-dev.txt
-python -m pytest tests -q          # 136 passing
+cd backend && .venv/bin/python -m pytest -q     # 302 passed
+cd frontend && npm run typecheck
 ```
 
----
+**Environment**
 
-## What is actually running
+| Variable | Purpose |
+|---|---|
+| `FEATHERLESS_API_KEY` | Reasoner. Without it the deterministic policy runs alone. |
+| `MAGNO_SESSION_KEY` | Fernet key for resume tokens. Must be stable across restarts. |
+| `MAGNO_CORS_ORIGINS` | Comma-separated frontend origins. |
+| `NEXT_PUBLIC_MAGNO_API` | Backend URL. Inlined at **build** time. |
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│  Next.js 15 terminal ── WebSocket /ws/telemetry (1 Hz frames   │
-│                          + instant event pushes)               │
-└───────────────────────────────┬────────────────────────────────┘
-                                │
-┌───────────────────────────────▼────────────────────────────────┐
-│  FastAPI                                                       │
-│                                                                │
-│   autopilot.py ── two cadences in one task:                    │
-│     5s   hedge tick    (deterministic, no model in the path)   │
-│     60s  reasoning tick (scan → model → gates → execute)       │
-│                                                                │
-│   MagnoTools ── the agent's four capabilities                  │
-│     scan_market_volatility · get_account_greeks                │
-│     execute_options_strategy · rebalance_portfolio             │
-│     ↑ same implementation drives the in-process loop AND the   │
-│       stdio MCP server. There is no privileged path.           │
-│                                                                │
-│   quant/  greeks.py · risk_gate.py · hedge_engine.py           │
-│           pure functions, no I/O, 111 unit tests               │
-└───────────┬─────────────────────────────┬──────────────────────┘
-            │                             │
-   Featherless AI                  Alpaca paper API
-   (OpenAI-compatible)             (paper=True, always)
-```
-
-### The risk gates
-
-Pure functions over plain data — no network, no clock, no LLM. They run
-identically for autonomous orders, terminal orders, and external MCP clients.
-
-| Gate | Rule | Why |
-|---|---|---|
-| `SPREAD_TOO_WIDE` | `(ask − bid) / mid ≤ 5%` | An option you cannot exit is one you cannot risk-manage |
-| `ALLOC_EXCEEDS_CAP` | notional ≤ 10% of buying power | No single contract can take the book down |
-| `DAILY_LOSS_HALT` | day drawdown < 5% | Stops new risk. **Hedging deliberately continues** |
-| `CONCENTRATION_CAP` | ≤ 6 open positions | Bounds correlated exposure |
-| `OI_TOO_THIN` | open interest ≥ 100 | Thin books gap through your exit |
-| `DTE_TOO_NEAR/FAR` | 5 ≤ DTE ≤ 60 | Avoids pin risk; preserves capital efficiency |
-| `PRICE_TOO_LOW/HIGH` | $0.10 ≤ mid ≤ $40 | No lottery tickets, no capital hogs |
-| `IV_UNSOLVABLE` | implied vol must invert | A quote outside arbitrage bounds is a broken quote |
-| `MARKET_CLOSED` | US equity hours | No new risk outside RTH |
-
-Every verdict — pass, warn and reject — is streamed to the execution ledger with
-the observed value and the limit, so any decision can be replayed from the UI.
-
-### The hedge engine
-
-Net delta is the share-equivalent sum:
-
-```
-Δ_net = Σ(option δ × contracts × 100) + Σ(shares held)
-```
-
-Two decisions worth calling out:
-
-**Exposure is bucketed per underlying, then summed.** The dial shows portfolio
-delta, but a hedge only ever executes against the underlying that produced the
-drift. A long SPY call and a long QQQ put can net to zero portfolio delta while
-each name carries 60 delta — hedging on the portfolio number alone silently
-converts a neutral book into a cross-asset basis bet. There is a test for this.
-
-**Hedges are fractional.** Rounding to whole shares leaves up to 0.5 delta of
-residual per underlying, which on a four-name book is most of the 1.0 trigger.
-Alpaca accepts fractional market DAY orders, so Magno neutralises to three
-decimals and converges to ~0.
-
-### Greeks
-
-Alpaca returns Greeks only on OPRA-subscribed accounts and they are routinely
-`null` on paper, so Magno computes its own: Newton-Raphson implied-vol inversion
-(seeded with Brenner-Subrahmanyam, bisection fallback in the wings) then
-analytic Black-Scholes-Merton Greeks. Alpaca's values are preferred whenever
-they are actually present.
-
-The math is tested against closed-form identities rather than golden values:
-put-call parity, delta parity, `Γ_call == Γ_put`, and central-difference checks
-of delta, gamma and vega against the pricer itself.
-
----
-
-## Featherless AI integration
-
-Featherless serves the strategy reasoner over its OpenAI-compatible endpoint.
-Set `FEATHERLESS_API_KEY` in `backend/.env`; the model is configurable via
-`FEATHERLESS_MODEL` (default `Qwen/Qwen2.5-72B-Instruct`).
-
-Three properties make this safe to run unattended:
-
-1. **Closed menu.** Candidates are gate-filtered *before* being shown, and a
-   reply naming any other symbol is rejected outright.
-2. **Clamped sizing.** Contract count is bounded by the envelope, and the full
-   gate chain re-runs on the concrete order.
-3. **Optional.** If Featherless is unreachable or returns junk, a deterministic
-   IV-rank policy produces the decision instead and the ledger records why. The
-   agent degrades to a quant rule, never to nothing.
-
-`/health` reports which reasoner is live.
-
----
-
-## MCP server
-
-The same four tools are published over stdio:
+Generate a session key with:
 
 ```bash
-cd backend
-ALPACA_API_KEY=... ALPACA_SECRET_KEY=... .venv/bin/python -m app.agents.alpaca_mcp
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Register it with any MCP client (`mcp.json` at the repo root is a ready-made
-Claude Desktop entry — fill in your paths and paper keys):
-
-```json
-{
-  "mcpServers": {
-    "magno-alpaca": {
-      "command": "/absolute/path/to/Magno/backend/.venv/bin/python",
-      "args": ["-m", "app.agents.alpaca_mcp"],
-      "cwd": "/absolute/path/to/Magno/backend",
-      "env": { "ALPACA_API_KEY": "PK...", "ALPACA_SECRET_KEY": "..." }
-    }
-  }
-}
-```
-
-An MCP client calling `execute_options_strategy` hits exactly the same gate
-chain as the autonomous loop, because it is the same function.
+**Onboarding.** Open the app, paste **paper** keys from the Alpaca Paper Trading dashboard, set the risk envelope, and the terminal connects. Keys go from the browser to the backend's memory and no further.
 
 ---
 
-## The shock simulator
+## Deployment
 
-The terminal's **Shock** drawer re-prices your live book at a hypothetical spot
-(±10%) through Black-Scholes with implied vol held constant. The delta drift
-that appears is the genuine gamma effect on your real positions — not an
-animation.
+Frontend on Vercel, backend as a container on Render (`./Dockerfile` at the repo root; `PORT` is honoured from the environment).
 
-While a shock is active the hedge engine **computes and logs** its corrective
-order but does not submit it. The move did not happen, and a real fill against a
-simulated price would corrupt the P&L the agent is judged on. Clear the shock to
-resume live hedging.
-
-This is the fastest way to see the whole loop: apply +2% to SPY, watch the dial
-break the drift cap and go cobalt, and read the corrective order in the ledger.
+One property worth stating plainly: on a free tier the backend spins down when idle, and the first request after that takes 30–60 seconds. Sessions rebuild from the resume token, but the cold start is real.
 
 ---
 
-## Security notes
+## Stack
 
-- The Alpaca trading client is constructed with `paper=True` unconditionally.
-  There is no code path in Magno that reaches a live endpoint.
-- Credentials submitted at onboarding are held in **process memory only** —
-  never written to disk, never logged, never returned to the client. A session
-  dies with the process, and `End` clears it immediately.
-- The browser stores only an opaque session id, never the keys themselves.
-
----
-
-## Layout
-
-```
-backend/
-  app/
-    main.py              FastAPI app + telemetry websocket
-    config.py            settings and risk defaults
-    broker.py            typed async adapter over alpaca-py
-    frame.py             1 Hz telemetry frame composition
-    events.py            the execution audit ledger
-    state_store.py       in-memory sessions
-    quant/
-      greeks.py          BSM pricing, IV inversion, OCC symbology
-      risk_gate.py       the nine deterministic gates
-      hedge_engine.py    delta aggregation, hedge intents, shock repricing
-    agents/
-      reasoner.py        Featherless client + deterministic fallback policy
-      alpaca_mcp.py      the four tools + stdio MCP server
-      autopilot.py       the autonomous loop
-    routers/             telemetry · scan · orders
-  tests/                 136 tests
-frontend/
-  app/                   landing · onboarding · terminal
-  components/            DeltaMagneticDial · GreeksTelemetry · OptionsChainTable
-                         ExecutionAuditStream · OrderSimulationModal · …
-  lib/                   api client · telemetry socket · formatting
-brand.md                 palette, typography and voice
-```
-
----
-
-Paper trading only. Not investment advice.
+FastAPI · Alpaca (paper) · Featherless AI · MCP · Next.js 15 · React 19 · Tailwind · Recharts

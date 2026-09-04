@@ -18,6 +18,83 @@ export const API_BASE =
 
 const SESSION_KEY = "magno.session";
 
+/* Encrypted resume token from onboarding.
+ *
+ * Sessions live in the backend's memory, and on a managed host that memory is
+ * cleared routinely -- a redeploy, or an idle spin-down on a free tier. Without
+ * this the operator re-enters their Alpaca keys every time that happens.
+ *
+ * The value is a Fernet token: the browser cannot read it, and only the server
+ * that issued it can. Storing it here is what makes a session outlive the
+ * process that created it. */
+const RESUME_KEY = "magno.resume";
+
+export function getResumeToken(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(RESUME_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setResumeToken(token: string | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (token) window.localStorage.setItem(RESUME_KEY, token);
+    else window.localStorage.removeItem(RESUME_KEY);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/* One in-flight resume at a time.
+ *
+ * A terminal mount fires several requests at once, so a restart produces a
+ * burst of simultaneous 401s. Without this they would each post the same token
+ * and each create a session, orphaning all but the last. */
+let resumeInFlight: Promise<boolean> | null = null;
+
+async function tryResume(): Promise<boolean> {
+  const token = getResumeToken();
+  if (!token) return false;
+  if (resumeInFlight) return resumeInFlight;
+
+  resumeInFlight = (async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/session/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume_token: token }),
+      });
+      if (!res.ok) {
+        // 401 means the token itself is dead -- expired, or minted under a key
+        // this server no longer has. Anything else (Alpaca down, keys revoked)
+        // may recover, so the token is kept.
+        if (res.status === 401) setResumeToken(null);
+        return false;
+      }
+      const data = (await res.json()) as { session_id?: string; resume_token?: string };
+      if (!data.session_id) return false;
+      setSessionId(data.session_id);
+      if (data.resume_token) setResumeToken(data.resume_token);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      resumeInFlight = null;
+    }
+  })();
+
+  return resumeInFlight;
+}
+
+/** Rebuild the session from the stored token. Returns false when there is
+ *  nothing to resume from, which means the operator must onboard again.
+ *  Exported for the telemetry socket, which authenticates by query parameter
+ *  and so cannot go through `request`. */
+export const attemptResume = tryResume;
+
 export function getSessionId(): string | null {
   if (typeof window === "undefined") return null;
   try {
@@ -72,12 +149,15 @@ function messageFrom(payload: unknown, fallback: string): string {
 async function request<T>(
   path: string,
   init: RequestInit = {},
-  { auth = true }: { auth?: boolean } = {},
+  { auth = true, retried = false }: { auth?: boolean; retried?: boolean } = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (auth) {
-    const id = getSessionId();
+    let id = getSessionId();
+    // No id but a saved token: the backend restarted and cleared the id on a
+    // previous call. Rebuild the session before giving up on the request.
+    if (!id && !retried && (await tryResume())) id = getSessionId();
     if (!id) {
       throw new ApiError("No active session. Reconnect your Alpaca account.", 401, null);
     }
@@ -108,8 +188,14 @@ async function request<T>(
   if (!response.ok) {
     if (response.status === 401 && auth) {
       // The session is gone server-side — most often because the backend
-      // restarted, since sessions are held in memory only. Clear the stale id
-      // so the terminal falls through to its guard instead of every control
+      // restarted, since sessions are held in memory only. If a resume token
+      // is held, rebuild the session and replay the request once; the operator
+      // never sees the interruption.
+      if (!retried && (await tryResume())) {
+        return request<T>(path, init, { auth, retried: true });
+      }
+      // Nothing to resume from, or the token is dead. Clear the stale id so
+      // the terminal falls through to its guard instead of every control
       // failing one by one with no explanation.
       setSessionId(null);
       if (typeof window !== "undefined") {
@@ -154,16 +240,27 @@ export const api = {
       { auth: false },
     ),
 
-  createSession: (payload: OnboardPayload) =>
-    request<{ session_id: string; session: SessionInfo }>(
-      "/api/session",
-      { method: "POST", body: JSON.stringify(payload) },
-      { auth: false },
-    ),
+  createSession: async (payload: OnboardPayload) => {
+    const result = await request<{
+      session_id: string;
+      session: SessionInfo;
+      resume_token?: string;
+    }>("/api/session", { method: "POST", body: JSON.stringify(payload) }, { auth: false });
+    // Persisted immediately: if the backend restarts before the operator does
+    // anything else, this is the only thing that can rebuild the session.
+    if (result.resume_token) setResumeToken(result.resume_token);
+    return result;
+  },
 
   getSession: () => request<{ session: SessionInfo }>("/api/session"),
 
-  endSession: () => request<{ ended: boolean }>("/api/session", { method: "DELETE" }),
+  endSession: async () => {
+    const result = await request<{ ended: boolean }>("/api/session", { method: "DELETE" });
+    // Ending a session must not leave a token behind that would silently
+    // resurrect it on the next request.
+    setResumeToken(null);
+    return result;
+  },
 
   telemetry: () => request<TelemetryFrame>("/api/telemetry"),
 

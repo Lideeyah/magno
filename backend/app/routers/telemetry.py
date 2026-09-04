@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+import dataclasses
+
 from ..agents import autopilot
 from ..agents.alpaca_mcp import MagnoTools
 from ..broker import AlpacaBroker, BrokerError
@@ -13,6 +15,8 @@ from ..deps import require_session
 from ..events import EventCategory
 from ..frame import build_frame, drop_cache
 from ..quant.risk_gate import RiskEnvelope
+from .. import session_token
+from ..session_token import TokenError
 from ..state_store import SessionState, Strategy, store
 
 router = APIRouter(prefix="/api", tags=["telemetry"])
@@ -131,15 +135,42 @@ async def create_session(payload: OnboardRequest) -> dict:
         min_dte=payload.min_dte,
         max_dte=payload.max_dte,
     )
-    state = store.create(broker, account, envelope, payload.strategy, payload.contract_qty)
+    return _establish(
+        broker=broker,
+        account=account,
+        envelope=envelope,
+        strategy=payload.strategy,
+        contract_qty=payload.contract_qty,
+        api_key=payload.api_key.strip(),
+        secret_key=payload.secret_key.strip(),
+        resumed=False,
+    )
+
+
+def _establish(
+    *,
+    broker: AlpacaBroker,
+    account,
+    envelope: RiskEnvelope,
+    strategy: Strategy,
+    contract_qty: int,
+    api_key: str,
+    secret_key: str,
+    resumed: bool,
+) -> dict:
+    """Create the session, write its opening ledger entries, and mint the
+    resume token. Shared by onboarding and resume so a rehydrated session is
+    indistinguishable from a freshly onboarded one."""
+    state = store.create(broker, account, envelope, strategy, contract_qty)
 
     state.audit.success(
         EventCategory.SYSTEM,
-        "Session established",
+        "Session resumed" if resumed else "Session established",
         f"Alpaca paper account {account.account_number} · equity ${account.equity:,.2f} · "
-        f"options level {account.options_trading_level} · strategy {payload.strategy.label}",
+        f"options level {account.options_trading_level} · strategy {strategy.label}",
         account_number=account.account_number,
         equity=account.equity,
+        resumed=resumed,
     )
     state.audit.info(
         EventCategory.RISK,
@@ -147,11 +178,75 @@ async def create_session(payload: OnboardRequest) -> dict:
         f"spread ≤ {envelope.max_spread_pct:.0%} · allocation ≤ "
         f"{envelope.max_allocation_pct:.0%} BP · drift cap ±{envelope.delta_drift_threshold:.2f}Δ · "
         f"loss breaker {envelope.max_daily_loss_pct:.0%} · max {envelope.max_open_positions} positions · "
-        f"IV rank buy ≤ {buy_at if buy_at is not None else '—'} / sell ≥ {sell_at if sell_at is not None else '—'}",
+        f"IV rank buy ≤ {envelope.iv_rank_buy_at if envelope.iv_rank_buy_at is not None else '—'} / "
+        f"sell ≥ {envelope.iv_rank_sell_at if envelope.iv_rank_sell_at is not None else '—'}",
         envelope=envelope.as_dict(),
     )
 
-    return {"session_id": state.session_id, "session": state.public_dict(), "account": account.as_dict()}
+    return {
+        "session_id": state.session_id,
+        "session": state.public_dict(),
+        "account": account.as_dict(),
+        # Held by the browser and posted back after a restart. Opaque to the
+        # client; only this server can decrypt it.
+        "resume_token": session_token.issue(
+            api_key=api_key,
+            secret_key=secret_key,
+            strategy=strategy.value,
+            contract_qty=contract_qty,
+            envelope=dataclasses.asdict(envelope),
+        ),
+    }
+
+
+class ResumeRequest(BaseModel):
+    resume_token: str = Field(min_length=16)
+
+
+@router.post("/session/resume")
+async def resume_session(payload: ResumeRequest) -> dict:
+    """Rebuild a session from an encrypted token issued at onboarding.
+
+    This is what stops a redeploy or an idle spin-down from making every
+    operator re-enter their Alpaca keys. The token is the only credential
+    store; the server keeps nothing between restarts.
+    """
+    try:
+        data = session_token.read(payload.resume_token)
+    except TokenError as exc:
+        # 401 rather than 400: the client's stored token is the thing that is
+        # no longer good, and the frontend treats 401 as "send them to
+        # onboarding" instead of retrying.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    try:
+        broker = AlpacaBroker(data["api_key"], data["secret_key"])
+        account = await broker.get_account()
+    except BrokerError as exc:
+        # The token decrypted, so the keys were ours -- but Alpaca has since
+        # rejected them. Revoked or rotated keys land here.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    # Only fields the dataclass actually declares, so a token minted before a
+    # field was renamed degrades to the default rather than raising TypeError.
+    known = {f.name for f in dataclasses.fields(RiskEnvelope)}
+    envelope = RiskEnvelope(**{k: v for k, v in (data.get("envelope") or {}).items() if k in known})
+
+    try:
+        strategy = Strategy(data["strategy"])
+    except ValueError:
+        strategy = Strategy.ADAPTIVE_VRP
+
+    return _establish(
+        broker=broker,
+        account=account,
+        envelope=envelope,
+        strategy=strategy,
+        contract_qty=int(data.get("contract_qty") or 1),
+        api_key=data["api_key"],
+        secret_key=data["secret_key"],
+        resumed=True,
+    )
 
 
 @router.get("/session")

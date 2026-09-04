@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getSessionId, telemetrySocketUrl } from "./api";
+import { attemptResume, getSessionId, telemetrySocketUrl } from "./api";
 import type { AuditEvent, TelemetryFrame } from "./types";
 
 export type ConnectionStatus =
@@ -73,11 +73,22 @@ export function useTelemetry() {
     let active: WebSocket | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let attempt = 0;
+    // Bounds the resume-and-reopen cycle so a token the server keeps refusing
+    // cannot loop the socket indefinitely.
+    let resumeTries = 0;
 
-    const open = () => {
+    const open = async () => {
       if (disposed) return;
 
-      const sessionId = getSessionId();
+      let sessionId = getSessionId();
+      if (!sessionId) {
+        // A stored resume token can rebuild the session without the operator
+        // re-entering credentials. Only when that fails is onboarding required.
+        setStatus("reconnecting");
+        const resumed = await attemptResume();
+        if (disposed) return;
+        if (resumed) sessionId = getSessionId();
+      }
       if (!sessionId) {
         setStatus("unauthorized");
         setError("No active session. Complete onboarding to connect an Alpaca account.");
@@ -135,6 +146,26 @@ export function useTelemetry() {
         active = null;
 
         if (event.code === 4401) {
+          // The backend no longer knows this session — almost always because
+          // it restarted. Rebuild from the stored token and reopen rather than
+          // sending the operator back to onboarding. Bounded, so a token the
+          // server keeps rejecting cannot spin here.
+          if (resumeTries < 2) {
+            resumeTries += 1;
+            setStatus("reconnecting");
+            setError("Session lost on the server. Restoring…");
+            void attemptResume().then((ok) => {
+              if (disposed) return;
+              if (ok) {
+                attempt = 0;
+                void open();
+              } else {
+                setStatus("unauthorized");
+                setError("This session expired. Reconnect your Alpaca account to continue.");
+              }
+            });
+            return;
+          }
           setStatus("unauthorized");
           setError("This session expired. Reconnect your Alpaca account to continue.");
           return;
