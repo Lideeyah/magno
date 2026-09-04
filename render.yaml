@@ -1,0 +1,27 @@
+# Render blueprint.
+#
+# The Dockerfile lives in backend/, not at the repo root, so rootDir has to be
+# set or the build fails with "failed to read dockerfile: open Dockerfile: no
+# such file or directory" -- Render clones the whole repo and looks in the top
+# level by default.
+services:
+  - type: web
+    name: magno-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+
+    envVars:
+      # The deployed frontend's origin. CORS is denied by default, so this has
+      # to match the Vercel domain exactly, scheme included and no trailing
+      # slash (the parser strips one, but be explicit).
+      - key: MAGNO_CORS_ORIGINS
+        value: https://magno-lideeyahs-projects.vercel.app
+
+      # Prompted for on first deploy and never stored in the repo. Without it
+      # the reasoner falls back to its deterministic policy rather than failing.
+      - key: FEATHERLESS_API_KEY
+        sync: false
